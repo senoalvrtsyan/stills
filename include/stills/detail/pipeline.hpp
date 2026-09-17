@@ -4,7 +4,10 @@
 // output Image.
 //
 // The container and its I/O live in MediaSource (detail/media_source.hpp), which this owns and
-// drives. Anything reaching the AVFormatContext goes through it.
+// drives. Anything reaching the AVFormatContext goes through it. The packets themselves, the GOP
+// replay buffer and the landing scan live in PacketReader (detail/packet_reader.hpp); where the
+// keyframes are lives in KeyframeIndex (detail/keyframe_index.hpp). Both are owned here and driven
+// here, and neither knows about this class or about each other's owner.
 //
 // A Pipeline is single-threaded by contract: callers serialise access (see worker.hpp).
 
@@ -27,7 +30,9 @@
 #include "stills/detail/ffmpeg.hpp"
 #include "stills/detail/frame_slot.hpp"
 #include "stills/detail/hw.hpp"
+#include "stills/detail/keyframe_index.hpp"
 #include "stills/detail/media_source.hpp"
+#include "stills/detail/packet_reader.hpp"
 #include "stills/detail/seek_cost_model.hpp"
 #include "stills/image.hpp"
 #include "stills/options.hpp"
@@ -287,13 +292,7 @@ class Pipeline {
   /// matrix). Runs after every MediaSource open and re-open, and owns nothing MediaSource owns.
   [[nodiscard]] std::expected<void, Error> attach_to_source() {
     codec_desc_ = source_.getCodec();
-    auto pkt = make_packet();
-    if (!pkt) return std::unexpected(pkt.error());
-    pkt_ = std::move(*pkt);
-    pkt_pending_ = false;
-    auto lpkt = make_packet();
-    if (!lpkt) return std::unexpected(lpkt.error());
-    land_pkt_ = std::move(*lpkt);
+    if (auto r = packets_.attach(); !r) return r;
     {
       auto fr2 = make_frame();
       if (!fr2) return std::unexpected(fr2.error());
@@ -595,21 +594,6 @@ class Pipeline {
   // extent) in a lazily built index that later requests position from with one byte seek. Decoding
   // verifies the landing again, for demuxers whose keyframe flags cannot be trusted.
 
-  /// A keyframe packet seen on a container without a trusted index: where it is (byte position for
-  /// AVSEEK_FLAG_BYTE) and, once the packets after it were read contiguously up to the next
-  /// keyframe, where its GOP ends. Sorted by pts.
-  struct KeyEntry {
-    std::int64_t pts;
-    std::int64_t dts;
-    std::int64_t pos;
-    std::int64_t next_pts;  ///< k::no_pts = unknown; INT64_MAX = the stream ended inside this GOP
-  };
-  static constexpr std::size_t no_entry = static_cast<std::size_t>(-1);
-  static constexpr std::size_t max_key_entries = 1u << 20;
-  /// Scanned packets of the chosen GOP are kept for replay up to this much; beyond it (4K at high
-  /// bit rates) the pipeline goes back to the keyframe with a byte seek instead.
-  static constexpr std::size_t max_gop_buffer_bytes = 64u << 20;
-
   void reset_position() noexcept {
     av_frame_unref(recv_.get());
     held_.clear();
@@ -617,13 +601,10 @@ class Pipeline {
     corrupt_last_.clear();
     frontier.reset();  // including the recorded holes: nothing before a reposition can matter
     landing_known_ = false;
-    demux_errors_ = decode_errors_ = 0;
+    decode_errors_ = 0;
     probe_frame_ = nullptr;
-    contig_key_ = no_entry;
-    clear_gop_buffer();
-    if (pkt_pending_ && pkt_) av_packet_unref(pkt_.get());
-    pkt_pending_ = false;
-    if (land_pkt_) av_packet_unref(land_pkt_.get());
+    keys_.resetContiguity();
+    packets_.resetPosition();
   }
 
   void after_seek(std::int64_t target, bool at_start) noexcept {
@@ -728,7 +709,7 @@ class Pipeline {
                   "re-opening the source: " + r.error().message);
     }
     tail_end_ = k::no_pts;  // a re-opened (or grown) source may reach further than it did
-    verified_to_ = k::no_pts;
+    packets_.resetVerifiedTo();
     positioned_ = true;
     awaiting_key_ = true;
     landed_at_start_ = true;
@@ -870,7 +851,7 @@ class Pipeline {
       if (!stream().seekable) return {};  // gave up on seeking: the re-open positioned at the start
       auto land = read_landing(P, /*scan=*/false, keyframe_mode, token);
       if (!land) return std::unexpected(std::move(land.error()));
-      if (land->found || landed_at_start_ || !key_flags_reliable_) return {};
+      if (land->found || landed_at_start_ || !packets_.areKeyFlagsReliable()) return {};
       if (land->first_key_pts == k::no_pts) {
         // No keyframe packet before the end: the seek landed in the tail. back_off() seeks itself.
         if (auto s = back_off(P, k::no_pts); !s) return s;
@@ -881,17 +862,20 @@ class Pipeline {
       // it.
       const std::int64_t kp = land->first_key_pts;
       const std::int64_t kd = land->first_key_dts;
-      const std::int64_t delay = (kd != k::no_pts && kp > kd) ? kp - kd : reorder_ticks_;
-      if (kd != k::no_pts && reorder_ticks_ > 0 && kd > P - reorder_ticks_ && seek_bias_ == 0) {
+      // Read after the landing, not before it: the packets it just read may have lowered the delay.
+      const std::int64_t reorder_ticks = keys_.getReorderTicks();
+      const std::int64_t delay = (kd != k::no_pts && kp > kd) ? kp - kd : reorder_ticks;
+      if (kd != k::no_pts && reorder_ticks > 0 && kd > P - reorder_ticks && seek_bias_ == 0) {
         // The demuxer searched its DTS index with our PTS unshifted (fragmented MP4): remember the
         // reorder delay so the next seek aims right. Open-GOP overshoots (the CRA's DTS is already
         // below P - delay) must not set it, or every seek would land a GOP early.
-        seek_bias_ = reorder_ticks_;
+        seek_bias_ = reorder_ticks;
       }
       if (round >= 3 || backoffs_ >= max_backoffs)
         return seek_to_start_and_land(P, keyframe_mode, token);
       target = kp - 1 - delay -
-               (round > 0 ? std::max({one_second(), gop_hint_, std::int64_t{1}}) * round : 0);
+               (round > 0 ? std::max({one_second(), keys_.getGopHint(), std::int64_t{1}}) * round
+                          : 0);
       ++backoffs_;
     }
   }
@@ -910,7 +894,7 @@ class Pipeline {
   /// and choose the last keyframe at or before it (recording every keyframe on the way).
   [[nodiscard]] std::expected<void, Error> position_scanned(std::int64_t P, bool keyframe_mode,
                                                             const CancelToken& token) {
-    if (const KeyEntry* e = covering_key(P); e != nullptr) {
+    if (const KeyEntry* e = keys_.findCoveringKey(P); e != nullptr) {
       if (auto r = byte_seek(*e); !r) return r;
       if (!keyframe_mode) return {};
       auto land = read_landing(P, /*scan=*/false, keyframe_mode, token);
@@ -918,14 +902,15 @@ class Pipeline {
       if (land->found) return {};
       // The recorded position no longer holds (the file changed): fall through to a fresh scan.
     }
-    const std::int64_t margin = frames_ticks(2) + reorder_ticks_;
-    std::int64_t aim = P - margin - (gop_hint_ > 0 ? gop_hint_ : 0);
+    const std::int64_t margin = frames_ticks(2) + keys_.getReorderTicks();
+    const std::int64_t gop_hint = keys_.getGopHint();
+    std::int64_t aim = P - margin - (gop_hint > 0 ? gop_hint : 0);
     if (auto r = seek_or_reopen(aim); !r) return r;
     for (;;) {
       if (!stream().seekable) return {};
       auto land = read_landing(P, /*scan=*/true, keyframe_mode, token);
       if (!land) return std::unexpected(std::move(land.error()));
-      if (land->found || landed_at_start_ || !key_flags_reliable_) return {};
+      if (land->found || landed_at_start_ || !packets_.areKeyFlagsReliable()) return {};
       // Landed after the keyframe covering P (or in the tail): retreat by a growing step.
       if (auto s = back_off(P, land->first_key_pts); !s) return s;
     }
@@ -937,8 +922,9 @@ class Pipeline {
   /// keyframe's DTS precedes its PTS, so aiming exactly at a keyframe lands just after it.
   [[nodiscard]] std::expected<void, Error> back_off(std::int64_t P,
                                                     std::int64_t observed_key /* or k::no_pts */) {
-    if (backoff_step_ <= 0) backoff_step_ = std::max({one_second(), gop_hint_, std::int64_t{1}});
-    const std::int64_t margin = frames_ticks(2) + reorder_ticks_;
+    if (backoff_step_ <= 0)
+      backoff_step_ = std::max({one_second(), keys_.getGopHint(), std::int64_t{1}});
+    const std::int64_t margin = frames_ticks(2) + keys_.getReorderTicks();
     const std::int64_t anchor =
         std::min(P, observed_key != k::no_pts ? observed_key : seek_target_);
     std::int64_t earlier = anchor - backoff_step_ - margin;
@@ -953,33 +939,7 @@ class Pipeline {
   /// a seek would land in the same or the next GOP and decode about as many frames anyway.
   [[nodiscard]] std::int64_t forward_scan_limit() const noexcept {
     const std::int64_t three_seconds = av_rescale_q(3, AVRational{1, 1}, stream().time_base);
-    return std::max(three_seconds, gop_hint_);
-  }
-
-  /// The index entry of the keyframe at or before P on a container with a trusted index, or
-  /// nullptr when the index does not cover P (a fragmented MP4 whose later fragments have not been
-  /// read yet). The mov index is in the DTS domain; `reorder_ticks_` (a keyframe's pts - dts,
-  /// learned from the first keyframe packet) moves P there. Matroska cues are in the PTS domain and
-  /// its packets carry no DTS, so the shift is zero.
-  [[nodiscard]] const AVIndexEntry* index_key_before(std::int64_t P) const noexcept {
-    const int n = avformat_index_get_entries_count(source_.getStream());
-    if (n <= 0) return nullptr;
-    const std::int64_t shift = index_shift();
-    const std::int64_t ts = P > std::numeric_limits<std::int64_t>::min() + shift ? P - shift : P;
-    int e = av_index_search_timestamp(source_.getStream(), ts, AVSEEK_FLAG_BACKWARD);
-    if (e < 0) return nullptr;
-    if (e == n - 1) {
-      const AVIndexEntry* last = avformat_index_get_entry(source_.getStream(), e);
-      if (last == nullptr ||
-          ts > last->timestamp + std::max<std::int64_t>(2 * stream().frame_duration_hint, 1))
-        return nullptr;
-    }
-    for (; e >= 0; --e) {
-      const AVIndexEntry* entry = avformat_index_get_entry(source_.getStream(), e);
-      if (entry == nullptr) return nullptr;
-      if ((entry->flags & AVINDEX_KEYFRAME) != 0) return entry;
-    }
-    return nullptr;
+    return std::max(three_seconds, keys_.getGopHint());
   }
 
   /// True when decoding forward to `target` is cheaper than seeking: the keyframe at or before the
@@ -991,12 +951,13 @@ class Pipeline {
     std::int64_t fed_ts = k::no_pts;
     bool covered = false;
     if (stream().index_trusted) {
-      if (const AVIndexEntry* kf = index_key_before(target); kf != nullptr) {
+      if (const AVIndexEntry* kf = keys_.getIndexKeyBefore(target, containerIndexOf(source_));
+          kf != nullptr) {
         key_ts = kf->timestamp;
-        fed_ts = last_fed_index_ts();
+        fed_ts = keys_.pickIndexTs(frontier.lastFedDts, frontier.lastFedPts);
         covered = true;
       }
-    } else if (const KeyEntry* e = covering_key(target); e != nullptr) {
+    } else if (const KeyEntry* e = keys_.findCoveringKey(target); e != nullptr) {
       key_ts = e->dts != k::no_pts ? e->dts : e->pts;
       fed_ts = e->dts != k::no_pts ? frontier.lastFedDts : frontier.lastFedPts;
       covered = true;
@@ -1018,89 +979,6 @@ class Pipeline {
              frames_ticks(
                  4);  // the index does not cover P (unread fragment): seeks are exact there
     return target - frontier.lastReceivedTs <= forward_scan_limit();
-  }
-
-  [[nodiscard]] std::size_t key_lower_bound(std::int64_t pts) const noexcept {
-    std::size_t lo = 0, hi = key_index_.size();
-    while (lo < hi) {
-      const std::size_t mid = lo + (hi - lo) / 2;
-      if (key_index_[mid].pts < pts)
-        lo = mid + 1;
-      else
-        hi = mid;
-    }
-    return lo;
-  }
-
-  /// Records a keyframe packet; links it to the previous keyframe when the packets in between were
-  /// read contiguously (so that keyframe's GOP extent becomes known).
-  void record_key(std::int64_t pts, std::int64_t dts, std::int64_t pos) {
-    if (pts == k::no_pts || pos < 0 || stream().index_trusted) return;
-    std::size_t i = key_lower_bound(pts);
-    if (i < key_index_.size() && key_index_[i].pts == pts) {
-      key_index_[i].dts = dts;
-      key_index_[i].pos = pos;
-    } else {
-      if (key_index_.size() >= max_key_entries) return;
-      key_index_.insert(key_index_.begin() + static_cast<std::ptrdiff_t>(i),
-                        KeyEntry{pts, dts, pos, k::no_pts});
-      if (contig_key_ != no_entry && contig_key_ >= i) ++contig_key_;
-    }
-    if (contig_key_ != no_entry && contig_key_ < key_index_.size() &&
-        key_index_[contig_key_].pts < pts) {
-      key_index_[contig_key_].next_pts = pts;
-      gop_hint_ = std::max(gop_hint_, pts - key_index_[contig_key_].pts);
-    }
-    contig_key_ = i;
-  }
-
-  /// The recorded keyframe whose GOP is known to contain P, or nullptr.
-  [[nodiscard]] const KeyEntry* covering_key(std::int64_t P) const noexcept {
-    if (key_index_.empty()) return nullptr;
-    std::size_t i = key_lower_bound(P);
-    if (i == key_index_.size() || key_index_[i].pts != P) {
-      if (i == 0) return nullptr;
-      --i;
-    }
-    const KeyEntry& e = key_index_[i];
-    if (e.pts > P || e.next_pts == k::no_pts || P >= e.next_pts) return nullptr;
-    return &e;
-  }
-
-  /// True when the container index records a keyframe in (key_pts, P], i.e. `key_pts` is probably
-  /// not the keyframe covering P. The DTS index is shifted by the *smallest* reorder delay, so an
-  /// open-GOP I-frame may be placed a frame early: a true result only makes read_landing scan on.
-  [[nodiscard]] bool index_has_key_between(std::int64_t key_pts, std::int64_t P) const noexcept {
-    if (!stream().index_trusted) return false;
-    const AVIndexEntry* kf = index_key_before(P);
-    if (kf == nullptr) return false;
-    const std::int64_t kf_pts = kf->timestamp + index_shift();
-    return kf_pts > key_pts && kf_pts <= P;
-  }
-
-  /// Whether `key_pts` is the keyframe at or before P with no other keyframe in between, known
-  /// from the container index (MP4/Matroska) or the recorded keyframe index (MPEG-TS).
-  [[nodiscard]] bool key_covers(std::int64_t key_pts, std::int64_t P) const noexcept {
-    if (key_pts > P) return false;
-    if (stream().index_trusted) {
-      const AVIndexEntry* kf = index_key_before(P);
-      if (kf == nullptr) return false;
-      // mov indexes DTS (a keyframe's pts is its dts plus the reorder delay); Matroska cues are
-      // PTS.
-      return kf->timestamp + index_shift() == key_pts;
-    }
-    const KeyEntry* e = covering_key(P);
-    return e != nullptr && e->pts == key_pts;
-  }
-
-  /// Offset from the container index's timestamp domain to presentation time: the reorder delay
-  /// when the index (and the keyframe packets) carry DTS (mov), zero for a PTS index (Matroska).
-  [[nodiscard]] std::int64_t index_shift() const noexcept {
-    return keys_have_dts_ ? reorder_ticks_ : 0;
-  }
-  /// The last fed packet's timestamp in the container index's domain.
-  [[nodiscard]] std::int64_t last_fed_index_ts() const noexcept {
-    return keys_have_dts_ ? frontier.lastFedDts : frontier.lastFedPts;
   }
 
   [[nodiscard]] std::int64_t frame_ts(const AVFrame& f) const noexcept {
@@ -1135,29 +1013,15 @@ class Pipeline {
     return r;
   }
 
-  /// Learns the stream's reorder delay (a keyframe's pts - dts; the smallest seen, so open-GOP CRAs
-  /// with leading pictures do not inflate it) and remembers the stream position of every keyframe
-  /// packet on containers without a trusted index.
-  void note_packet(const AVPacket& p) {
-    const bool key = (p.flags & AV_PKT_FLAG_KEY) != 0;
-    if (!key) return;
-    if (p.pts != k::no_pts && p.dts != k::no_pts && p.pts >= p.dts) {
-      const std::int64_t d = p.pts - p.dts;
-      reorder_ticks_ = reorder_known_ ? std::min(reorder_ticks_, d) : d;
-      reorder_known_ = true;
-      keys_have_dts_ = true;
-    }
-    record_key(p.pts, p.dts, p.pos);
-  }
-
-  /// Sends the packet held in pkt_. Returns 0 (consumed), k::eagain (kept for a retry after the
+  /// Sends the reader's live packet. Returns 0 (consumed), k::eagain (kept for a retry after the
   /// decoder has been drained) or an error (packet dropped).
   [[nodiscard]] int send_held_packet() noexcept {
-    const std::int64_t fed_dts = pkt_->dts;
-    const std::int64_t fed_pts = pkt_->pts;
-    const int s = avcodec_send_packet(codec_.get(), pkt_.get());
+    AVPacket& pkt = packets_.getPacket();
+    const std::int64_t fed_dts = pkt.dts;
+    const std::int64_t fed_pts = pkt.pts;
+    const int s = avcodec_send_packet(codec_.get(), &pkt);
     if (s == k::eagain) {
-      pkt_pending_ = true;  // the decoder wants a receive first; keep the packet
+      packets_.holdPacketForRetry();  // the decoder wants a receive first; keep the packet
       return s;
     }
     if (s == 0) {
@@ -1166,237 +1030,32 @@ class Pipeline {
         frontier.lastFedPts =
             frontier.lastFedPts == k::no_pts ? fed_pts : std::max(frontier.lastFedPts, fed_pts);
     }
-    av_packet_unref(pkt_.get());
-    pkt_pending_ = false;
+    packets_.releasePacket();
     return s;
   }
 
-  /// Reads the next packet of our stream into pkt_ (other streams are dropped). Returns 0, k::eof
-  /// (after a live-source growth check), k::exit_requested or a demux error (transient ones are
-  /// skipped up to a limit).
-  /// Not noexcept: the keyframe index this records into allocates. A std::bad_alloc here
-  /// would be std::terminate rather than the ErrorCode::out_of_memory the API can report.
-  [[nodiscard]] int read_video_packet(const CancelToken& token) {
-    if (replaying_ && replay_pos_ < gop_buffer_.size()) {
-      // Packets scanned past the chosen keyframe are replayed; the demuxer sits right after them.
-      av_packet_unref(pkt_.get());
-      av_packet_move_ref(pkt_.get(), gop_buffer_[replay_pos_].get());
-      if (++replay_pos_ == gop_buffer_.size()) clear_gop_buffer();
-      return 0;
-    }
-    for (;;) {
-      if (token.requested()) return k::exit_requested;
-      int r = source_.readPacket(*pkt_);
-      if (r == k::exit_requested) return r;
-      if (r == k::eof || (r < 0 && ++demux_errors_ > max_consecutive_errors)) return k::eof;
-      if (r < 0) {
-        frontier.tainted = true;
-        continue;  // transient demux error: skip and keep reading
-      }
-      demux_errors_ = 0;
-      if (pkt_->stream_index == stream().index && pkt_->pts != k::no_pts) {
-        verified_to_ = verified_to_ == k::no_pts ? pkt_->pts : std::max(verified_to_, pkt_->pts);
-      }
-      if (pkt_->stream_index != stream().index) {
-        av_packet_unref(pkt_.get());
-        continue;
-      }
-      if (!first_packet_seen_) {
-        // Trust the demuxer's keyframe flags only if it flags the very first packet; a demuxer
-        // that never sets the flag must not make us skip.
-        first_packet_seen_ = true;
-        key_flags_reliable_ = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
-      }
-      note_packet(*pkt_);
-      return 0;
-    }
-  }
-
-  /// Keeps the packet in pkt_ for replay (read_landing scan). False when the cap is exceeded.
-  [[nodiscard]] bool buffer_packet() {
-    const std::size_t bytes = static_cast<std::size_t>(std::max(pkt_->size, 0));
-    if (gop_buffer_bytes_ + bytes > max_gop_buffer_bytes) {
-      av_packet_unref(pkt_.get());
-      clear_gop_buffer();
-      return false;
-    }
-    PacketPtr p{av_packet_alloc()};
-    if (!p) {
-      av_packet_unref(pkt_.get());
-      clear_gop_buffer();
-      return false;
-    }
-    av_packet_move_ref(p.get(), pkt_.get());
-    gop_buffer_.push_back(std::move(p));
-    gop_buffer_bytes_ += bytes;
-    return true;
-  }
-  void clear_gop_buffer() noexcept {
-    gop_buffer_.clear();
-    gop_buffer_bytes_ = 0;
-    replay_pos_ = 0;
-    replaying_ = false;
-  }
-
-  /// Result of read_landing().
-  struct Landing {
-    bool found{false};  ///< a keyframe packet at or before P is ready (pending or positioned)
-    std::int64_t first_key_pts{k::no_pts};  ///< the first keyframe packet seen (> P when !found)
-    std::int64_t first_key_dts{k::no_pts};
-    bool eof{false};
-  };
-
-  /// Establishes where a seek landed from the packets, without decoding. `scan == false` (trusted
-  /// index): the first keyframe packet is the landing; it is kept in pkt_ for the decoder when it
-  /// is at or before P. `scan == true` (no index): keeps reading through the GOPs up to P, records
-  /// every keyframe, and settles on the last keyframe at or before P — held in pkt_ for a
-  /// keyframe-only decode, or reached again with a byte seek for an exact decode.
-  [[nodiscard]] std::expected<Landing, Error> read_landing(std::int64_t P, bool scan,
-                                                           bool keyframe_mode,
-                                                           const CancelToken& token) {
-    Landing L;
-    std::int64_t best_pts = k::no_pts, best_dts = k::no_pts, best_pos = -1;
-    bool best_held = false;  // keyframe mode: the best packet is parked in land_pkt_
-    bool buffering = false;  // exact mode: packets after the best keyframe are kept for replay
-    bool scanning = scan;    // becomes true on a trusted-index container whose seek undershot
-    std::int64_t landing_pts = k::no_pts;  // first packet read after the seek
-    // arm_keyframe_decode() passes P = INT64_MAX ("the next keyframe, wherever it is"): saturate.
-    std::int64_t horizon = 0;
-    if (__builtin_add_overflow(P, reorder_ticks_ + frames_ticks(1), &horizon)) {
-      horizon = std::numeric_limits<std::int64_t>::max();
-    }
-    clear_gop_buffer();
-    for (;;) {
-      const int r = read_video_packet(token);
-      if (r == k::exit_requested) {
-        if (token.requested()) return fail(ErrorCode::cancelled, "cancelled");
-        return fail(ErrorCode::decode_failed, r,
-                    "av_read_frame: interrupted without a cancellation");
-      }
-      if (r == k::eof) {
-        L.eof = true;
+  /// PacketReader::readLanding() plus the part only positioning may carry out. The scan reads
+  /// packets and chooses the keyframe; going back to one is a seek, and seeks are not the
+  /// reader's. Returned as data rather than done in place so the dependency runs one way:
+  /// positioning drives the reader, never the other way round.
+  [[nodiscard]] std::expected<PacketReader::Landing, Error> read_landing(
+      std::int64_t P, bool scan, bool keyframe_mode, const CancelToken& token) {
+    auto land =
+        packets_.readLanding(source_, keys_, P, scan, keyframe_mode, frontier.tainted, token);
+    if (!land) return land;
+    if (land->awaitKey) awaiting_key_ = true;
+    switch (land->rewind) {
+      case PacketReader::Landing::Rewind::none:
         break;
-      }
-      if (!key_flags_reliable_) {
-        // Cannot tell keyframes apart at the packet level: feed everything, the decoder sorts it
-        // out.
-        pkt_pending_ = true;
-        L.found = true;
-        return L;
-      }
-      const bool key = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
-      const std::int64_t pts =
-          pkt_->pts != k::no_pts
-              ? pkt_->pts
-              : (pkt_->dts != k::no_pts ? pkt_->dts + reorder_ticks_ : k::no_pts);
-      if (landing_pts == k::no_pts && pts != k::no_pts) landing_pts = pts;
-      if (!key) {
-        if (buffering) {
-          // Part of the chosen keyframe's GOP: keep it instead of reading it twice.
-          const bool past = pts != k::no_pts && pts > horizon;
-          if (!buffer_packet()) buffering = false;  // over the cap: fall back to a byte seek
-          if (scanning && best_pts != k::no_pts && past)
-            break;  // every later packet is past P in decode order too
-          continue;
-        }
-        // In keyframe mode the scan runs on to the next keyframe so the chosen one's GOP extent is
-        // recorded and later requests inside it are answered from the held frame.
-        if (scanning && !keyframe_mode && best_pts != k::no_pts && pts != k::no_pts &&
-            pts > horizon) {
-          av_packet_unref(pkt_.get());
-          break;
-        }
-        av_packet_unref(pkt_.get());
-        continue;
-      }
-      if (pts == k::no_pts) {
-        pkt_pending_ = true;  // a keyframe without a timestamp: nothing to verify against
-        L.found = true;
-        return L;
-      }
-      if (L.first_key_pts == k::no_pts) {
-        L.first_key_pts = pts;
-        L.first_key_dts = pkt_->dts;
-        // No keyframe between the landing and this one: the GOP is at least that long.
-        if (landing_pts != k::no_pts && pts > landing_pts)
-          gop_hint_ = std::max(gop_hint_, pts - landing_pts);
-      }
-      if (pts > P) {
-        if (best_pts != k::no_pts) {
-          // The keyframe before this one is the answer; this packet is the next in decode order.
-          if (buffering && !buffer_packet())
-            buffering = false;
-          else if (!buffering)
-            av_packet_unref(pkt_.get());
-          break;
-        }
-        av_packet_unref(pkt_.get());
-        return L;  // overshoot: nothing at or before P was seen
-      }
-      if (!scanning) {
-        if (!index_has_key_between(pts, P)) {
-          pkt_pending_ = true;  // the landing keyframe covers P
-          L.found = true;
-          return L;
-        }
-        // The index records a later keyframe at or before P (mov lands a GOP early on edit-list
-        // files). Read on like a scan: a keyframe past P ends it with the last one at or before P,
-        // so a wrong index entry cannot make us overshoot.
-        scanning = true;
-      }
-      best_pts = pts;
-      best_dts = pkt_->dts;
-      best_pos = pkt_->pos;
-      if (keyframe_mode) {
-        av_packet_unref(land_pkt_.get());
-        av_packet_move_ref(land_pkt_.get(), pkt_.get());
-        best_held = true;
-      } else {
-        clear_gop_buffer();
-        buffering = buffer_packet();  // the keyframe itself is the first packet to feed
-      }
-    }
-    if (best_pts == k::no_pts) {
-      clear_gop_buffer();
-      return L;  // tail of the stream without a keyframe, or nothing at all
-    }
-    if (L.eof) {
-      // The stream ended inside this GOP: its extent is known.
-      const std::size_t i = key_lower_bound(best_pts);
-      if (i < key_index_.size() && key_index_[i].pts == best_pts)
-        key_index_[i].next_pts = std::numeric_limits<std::int64_t>::max();
-    }
-    L.found = true;
-    if (keyframe_mode && best_held) {
-      av_packet_unref(pkt_.get());
-      av_packet_move_ref(pkt_.get(), land_pkt_.get());
-      pkt_pending_ = true;
-      return L;
-    }
-    if (buffering && !gop_buffer_.empty()) {
-      // The chosen keyframe and its GOP are buffered: decoding replays them.
-      awaiting_key_ = true;
-      replaying_ = true;
-      return L;
-    }
-    clear_gop_buffer();
-    // GOP too large to buffer: go back to the keyframe by byte position (trusted-index containers
-    // refuse byte seeks and re-seek by timestamp below).
-    if (best_pos >= 0 && !stream().index_trusted) {
-      const std::size_t i = key_lower_bound(best_pts);
-      if (i < key_index_.size() && key_index_[i].pts == best_pts) {
-        if (auto r = byte_seek(key_index_[i]); !r) return std::unexpected(std::move(r.error()));
-      } else {
-        if (auto r = byte_seek(KeyEntry{best_pts, best_dts, best_pos, k::no_pts}); !r)
+      case PacketReader::Landing::Rewind::byteSeek:
+        if (auto r = byte_seek(land->rewindEntry); !r) return std::unexpected(std::move(r.error()));
+        break;
+      case PacketReader::Landing::Rewind::timestampSeek:
+        if (auto r = seek_or_reopen(land->rewindTs); !r)
           return std::unexpected(std::move(r.error()));
-      }
-      L.found = true;
-      return L;
+        break;
     }
-    // No byte position (unusual): re-seek by timestamp.
-    if (auto r = seek_or_reopen(best_pts - reorder_ticks_); !r)
-      return std::unexpected(std::move(r.error()));
-    return L;
+    return land;
   }
 
   /// Keyframe mode after positioning: feed the pending keyframe packet and drain, so the decoder
@@ -1404,14 +1063,14 @@ class Pipeline {
   /// hold ~thread_count packets). The decoder must be flushed before it is fed again
   /// (`frontier.drained`).
   [[nodiscard]] std::expected<void, Error> arm_keyframe_decode(const CancelToken& token) {
-    if (!pkt_pending_) {
+    if (!packets_.isPacketPending()) {
       // Positioned but not read yet: fetch the keyframe packet.
       auto land = read_landing(std::numeric_limits<std::int64_t>::max(), /*scan=*/false,
                                /*keyframe_mode=*/true, token);
       if (!land) return std::unexpected(std::move(land.error()));
-      if (!pkt_pending_) return {};  // nothing to feed (EOF); select() reports it
+      if (!packets_.isPacketPending()) return {};  // nothing to feed (EOF); select() reports it
     }
-    if (!key_flags_reliable_ || pkt_->pts == k::no_pts)
+    if (!packets_.areKeyFlagsReliable() || packets_.getPacket().pts == k::no_pts)
       return {};  // cannot single out a keyframe: decode normally
     awaiting_key_ = false;
     const int s = send_held_packet();
@@ -1428,14 +1087,13 @@ class Pipeline {
   /// k::exit_requested (interrupted) or a decoder error.
   /// Not noexcept: the skipped-frame record below it allocates.
   [[nodiscard]] int feed_one(const CancelToken& token) {
-    if (pkt_pending_) {
-      if ((pkt_->flags & AV_PKT_FLAG_KEY) != 0) awaiting_key_ = false;
+    if (packets_.isPacketPending()) {
+      if ((packets_.getPacket().flags & AV_PKT_FLAG_KEY) != 0) awaiting_key_ = false;
       prepare_send();
       const int s = send_held_packet();
       if (s == k::eagain) {
         // Both receive and send report EAGAIN: the decoder violates its contract.
-        av_packet_unref(pkt_.get());
-        pkt_pending_ = false;
+        packets_.releasePacket();
         return k::einval;
       }
       if (s == 0) return 0;
@@ -1446,17 +1104,17 @@ class Pipeline {
     if (frontier.drained)
       return k::eof;  // the decoder was drained for a keyframe-only decode; a seek resets it
     for (;;) {
-      const int r = read_video_packet(token);
+      const int r = packets_.readVideoPacket(source_, keys_, frontier.tainted, token);
       if (r == k::exit_requested) return r;
       if (r == k::eof) {
         frontier.draining = true;
         (void)avcodec_send_packet(codec_.get(), nullptr);
         return k::eof;
       }
-      const bool key_packet = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
-      if (awaiting_key_ && key_flags_reliable_ && !key_packet) {
+      const bool key_packet = (packets_.getPacket().flags & AV_PKT_FLAG_KEY) != 0;
+      if (awaiting_key_ && packets_.areKeyFlagsReliable() && !key_packet) {
         // Mid-GOP after a seek: the decoder would decode these in full and drop them anyway.
-        av_packet_unref(pkt_.get());
+        packets_.unrefPacket();
         continue;
       }
       if (key_packet) awaiting_key_ = false;
@@ -1482,11 +1140,12 @@ class Pipeline {
   /// time has already been fed (B-frames follow their forward reference in decode order) and that
   /// later time is itself before the window.
   void prepare_send() {
-    const bool key = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
+    const AVPacket& pkt = packets_.getPacket();
+    const bool key = (pkt.flags & AV_PKT_FLAG_KEY) != 0;
     AVDiscard skip = AVDISCARD_DEFAULT;
-    if (skip_before_ts_ != k::no_pts && key_flags_reliable_ && !key && pkt_->pts != k::no_pts &&
-        frontier.lastFedPts != k::no_pts) {
-      const std::int64_t pts = pkt_->pts;
+    if (skip_before_ts_ != k::no_pts && packets_.areKeyFlagsReliable() && !key &&
+        pkt.pts != k::no_pts && frontier.lastFedPts != k::no_pts) {
+      const std::int64_t pts = pkt.pts;
       if (pts < frontier.lastFedPts && frontier.lastFedPts <= skip_before_ts_) {
         skip = AVDISCARD_NONREF;
         frontier.skipped.record(pts);  // if the decoder drops it, nothing may decode across it
@@ -1525,8 +1184,7 @@ class Pipeline {
         const bool key = (recv_->flags & AV_FRAME_FLAG_KEY) != 0;
         // GOP length estimate (a lower bound, exact at the next keyframe): feeds the back-off step
         // and the forward-scan limit.
-        if (frontier.lastKeyTs != k::no_pts && t > frontier.lastKeyTs)
-          gop_hint_ = std::max(gop_hint_, t - frontier.lastKeyTs);
+        keys_.noteKeyframeSpan(frontier.lastKeyTs, t);
         if (key) frontier.lastKeyTs = t;
         if ((recv_->flags & AV_FRAME_FLAG_CORRUPT) != 0) {
           frontier.skipped.record(t);  // not produced: nothing may decode across it
@@ -1697,24 +1355,26 @@ class Pipeline {
                                                                     const CancelToken& token) {
     if (sel.frame == nullptr) return sel;
     const std::int64_t t = frame_ts(*sel.frame);
-    const std::int64_t gop = std::max({gop_hint_, frames_ticks(2), std::int64_t{1}});
-    if (P <= t + gop || P <= verified_to_) return sel;  // plainly inside the data
+    const std::int64_t gop = std::max({keys_.getGopHint(), frames_ticks(2), std::int64_t{1}});
+    if (P <= t + gop || P <= packets_.getVerifiedTo()) return sel;  // plainly inside the data
     if (tail_end_ == k::no_pts) {
       // The demuxer sits just after the chosen keyframe: read on until the question is answered.
       for (;;) {
-        const int r = read_video_packet(token);
+        const int r = packets_.readVideoPacket(source_, keys_, frontier.tainted, token);
         if (r == k::exit_requested) {
           if (token.requested()) return fail(ErrorCode::cancelled, "cancelled");
           return sel;  // an I/O hiccup is not proof of anything: keep the keyframe
         }
         if (r == k::eof) {
-          tail_end_ = verified_to_ != k::no_pts
-                          ? verified_to_ + std::max<std::int64_t>(stream().frame_duration_hint, 1)
+          const std::int64_t verified = packets_.getVerifiedTo();
+          tail_end_ = verified != k::no_pts
+                          ? verified + std::max<std::int64_t>(stream().frame_duration_hint, 1)
                           : t + std::max<std::int64_t>(stream().frame_duration_hint, 1);
           break;
         }
-        av_packet_unref(pkt_.get());
-        if (verified_to_ != k::no_pts && verified_to_ > P) break;
+        packets_.unrefPacket();
+        const std::int64_t verified = packets_.getVerifiedTo();
+        if (verified != k::no_pts && verified > P) break;
       }
       positioned_ = false;  // the demuxer has moved; the next request repositions
     }
@@ -1804,7 +1464,8 @@ class Pipeline {
       if (keyframe_mode) {
         // The held frame is the keyframe covering P (the index says no keyframe lies in (h, P]).
         const std::int64_t h = frame_ts(*held_.getFrame());
-        if ((held_.getFrame()->flags & AV_FRAME_FLAG_KEY) != 0 && key_covers(h, P)) {
+        if ((held_.getFrame()->flags & AV_FRAME_FLAG_KEY) != 0 &&
+            keys_.doesKeyCover(h, P, containerIndexOf(source_))) {
           return verify_keyframe_tail(
               Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()}, P, token);
         }
@@ -1824,16 +1485,17 @@ class Pipeline {
     // Frames well before the tolerance window may skip their non-reference members. Off in
     // keyframe mode and on inputs without keyframe flags.
     skip_before_ts_ = k::no_pts;
-    if (!keyframe_mode && key_flags_reliable_) {
-      const std::int64_t margin = reorder_ticks_ + frames_ticks(2);
+    if (!keyframe_mode && packets_.areKeyFlagsReliable()) {
+      const std::int64_t margin = keys_.getReorderTicks() + frames_ticks(2);
       skip_before_ts_ = lo > std::numeric_limits<std::int64_t>::min() + margin ? lo - margin : lo;
     }
     if (keyframe_mode) {
       if (auto r = position_for(P, true, token); !r) return std::unexpected(std::move(r.error()));
+      const AVPacket& pkt = packets_.getPacket();
       const bool pre_edit =
-          pkt_pending_ &&
-          ((pkt_->flags & AV_PKT_FLAG_DISCARD) != 0 ||
-           (first_frame_ts_ != k::no_pts && pkt_->pts != k::no_pts && pkt_->pts < first_frame_ts_));
+          packets_.isPacketPending() &&
+          ((pkt.flags & AV_PKT_FLAG_DISCARD) != 0 ||
+           (first_frame_ts_ != k::no_pts && pkt.pts != k::no_pts && pkt.pts < first_frame_ts_));
       if (pre_edit) {
         // The keyframe covering P precedes the first presented frame (an edit list trimmed its
         // GOP). Answer with the first presented frame, clamped, decoded exactly: the decoder drops
@@ -1921,8 +1583,8 @@ class Pipeline {
   ActiveDecoder active_;  // guarded by active_mutex_
   std::optional<Converter> converter_;
 
-  PacketPtr pkt_;
-  bool pkt_pending_{false};  ///< pkt_ holds a packet the decoder refused with EAGAIN
+  KeyframeIndex keys_;  ///< where the keyframes are; the reader records into it as it reads
+  PacketReader packets_;
   FramePtr recv_;  ///< scratch: avcodec_receive_frame writes here, then a slot adopts it
   FrameSlot held_, pending_, corrupt_last_;
   DecodeFrontier frontier;  ///< where the decoder is; every reposition resets it
@@ -1931,42 +1593,21 @@ class Pipeline {
   bool positioned_{false};
   bool landed_at_start_{false};  ///< the last positioning was the explicit start seek or a re-open
   bool awaiting_key_{false};     ///< no keyframe packet fed since the last positioning
-  bool first_packet_seen_{false};
-  bool key_flags_reliable_{
-      false};  ///< the demuxer flags keyframe packets (first packet was flagged)
   std::int64_t seek_target_{0};
   /// One re-position per request after an end of stream that decoded nothing (see select()).
   bool eof_retried_{false};
   bool keyframe_only_{false};  ///< the current request is in nearest-keyframe mode
-  std::int64_t gop_hint_{0};   ///< largest keyframe spacing observed, in stream ticks
   std::int64_t first_frame_ts_{k::no_pts};
   std::int64_t backoff_step_{0};
   int backoffs_{0};
   bool landing_known_{false};  ///< keyframe mode: the fed keyframe packet is the answer
-  bool keys_have_dts_{false};  ///< keyframe packets carry a dts (mov); Matroska's do not
-  std::int64_t reorder_ticks_{
-      0};  ///< a keyframe's pts - dts (the B-frame reorder delay), smallest seen
-  bool reorder_known_{false};
   std::int64_t seek_bias_{0};  ///< subtracted from seek targets on demuxers that search a DTS index
                                ///< with an unshifted PTS (fragmented MP4)
-  std::vector<KeyEntry>
-      key_index_;  ///< keyframe packets seen (containers without a trusted index), by pts
-  std::size_t contig_key_{
-      no_entry};  ///< entry of the last keyframe read without a seek since (its GOP extent grows)
-  PacketPtr land_pkt_;  ///< keyframe mode: the chosen keyframe packet while scanning past it
   std::optional<Size> req_max_;  ///< RequestOptions::maximum_size of the current request
   std::int64_t skip_before_ts_{
       k::no_pts};  ///< packets whose frames end before this may skip non-reference frames
-  std::int64_t verified_to_{
-      k::no_pts};  ///< largest packet presentation time actually read from the source
   std::int64_t tail_end_{k::no_pts};  ///< end of the data once the end of stream has been observed
                                       ///< (k::no_pts = not yet)
-  std::vector<PacketPtr> gop_buffer_;  ///< exact mode: the chosen keyframe's packets scanned past
-                                       ///< P, replayed to the decoder
-  std::size_t gop_buffer_bytes_{0};
-  std::size_t replay_pos_{0};
-  bool replaying_{false};  ///< the scan is over; read_video_packet serves gop_buffer_ first
-  int demux_errors_{0};
   int decode_errors_{0};
   long total_decode_errors_{0};
   std::string

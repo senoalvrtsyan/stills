@@ -66,6 +66,7 @@ add_executable(stills_tests
   test_sync.cpp
   test_containers.cpp
   test_keyframe.cpp
+  test_keyframe_index.cpp
   test_output.cpp
   test_transform.cpp
   test_image.cpp
