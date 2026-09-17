@@ -1,0 +1,10 @@
+# Formatted with clang-format 23.1.1. The style options below are what matters, but comment
+# re-wrapping and comment alignment differ slightly between major versions, so a much older
+# clang-format may report a handful of violations on an otherwise clean tree. Reformat with the
+# version you have, or pin one in CI; do not widen ColumnLimit to make a diff go away.
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 2
+DerivePointerAlignment: false
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline

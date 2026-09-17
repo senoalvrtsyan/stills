@@ -1,0 +1,5 @@
+# Allocations made once per process by system libraries during hardware-device probing; not ours.
+leak:libcuda.so
+leak:libdbus-1.so
+leak:libnvidia
+leak:libdrm

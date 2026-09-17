@@ -1,0 +1,24 @@
+# libavcodec's frame-thread pool allocates and frees frame buffers on its worker threads with
+# libavutil's own (uninstrumented) atomics; ThreadSanitizer reports every such allocation that our
+# thread later frees as a data race. The libraries ship without symbols, so the entries name the
+# modules. `race:` (data-race reports only) is used instead of `called_from_lib` so that deadlock,
+# lock-order and thread-leak reports involving libav stay visible.
+#
+# Caveat, because it is not a narrow filter: TSan drops a report when *any* frame of *either* stack
+# matches, so a genuine race in stills would be hidden whenever the other stack happens to run
+# through libav. The check on that is to run without this file — the [async],[cancel] group (27
+# cases) reports zero with suppressions removed entirely. Re-run it that way after touching the
+# threading code, not just with these entries in place.
+race:libavcodec.so
+race:libavutil.so
+race:libavformat.so
+race:libswscale.so
+
+# interop::available_device_types() creates and destroys one device context per hardware family.
+# The Vulkan and OpenCL drivers start their own threads inside that call and allocate on one while
+# freeing on another, with their own (uninstrumented) synchronisation; TSan reports the malloc/free
+# pair as a race inside the driver module. Nothing in this library touches that memory. `race:`
+# again, so a deadlock or thread leak involving the drivers stays visible.
+race:libvulkan
+race:libOpenCL
+race:libnvidia
