@@ -142,7 +142,10 @@ class Time {
   /// `value / timescale` seconds. A non-positive timescale yields an invalid Time.
   explicit constexpr Time(std::int64_t value, std::int32_t timescale) noexcept
       : value_(value), timescale_(timescale), kind_(timescale > 0 ? Kind::finite : Kind::invalid) {
-    if (kind_ == Kind::invalid) value_ = 0, timescale_ = 1;
+    if (kind_ == Kind::invalid) {
+      value_ = 0;
+      timescale_ = 1;
+    }
   }
 
   /// Implicit, lossless conversion from integral chrono durations whose period is 1/N seconds.

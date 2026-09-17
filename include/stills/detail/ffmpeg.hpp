@@ -28,7 +28,11 @@
 #pragma GCC diagnostic ignored "-Wcast-align"
 #pragma GCC diagnostic ignored "-Wdouble-promotion"
 #pragma GCC diagnostic ignored "-Wzero-as-null-pointer-constant"
+// The other six exist in both compilers; -Wuseless-cast is GCC's alone, and Clang -- which defines
+// __GNUC__ -- rejects the pragma naming it under -Werror (-Wunknown-warning-option).
+#if ! defined(__clang__)
 #pragma GCC diagnostic ignored "-Wuseless-cast"
+#endif
 #endif
 extern "C" {
 #include <libavcodec/avcodec.h>

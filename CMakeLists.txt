@@ -21,6 +21,12 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
   libavcodec>=60.31
   libavutil>=58.29
   libswscale>=7)
+# Nothing marks libav's headers SYSTEM here, deliberately: they already reach our targets that way,
+# for two reasons this file does not control. CMake treats an IMPORTED target's include directories
+# as SYSTEM by default, transitively through `stills`; and where pkg-config names a directory the
+# compiler already searches implicitly, CMake emits no include flag for it at all -- which is what
+# happens on this machine. So the -Werror build does not depend on the diagnostic pragmas in
+# detail/ffmpeg.hpp. Those are for consumers who reach FFmpeg through a plain -I.
 find_package(Threads REQUIRED)
 
 include(GNUInstallDirs)

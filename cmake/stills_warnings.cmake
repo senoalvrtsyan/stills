@@ -9,7 +9,10 @@ function(stills_apply_warnings target)
       -Wnon-virtual-dtor -Woverloaded-virtual -Wnull-dereference
       -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough>
     $<$<CXX_COMPILER_ID:GNU>:
-      -Wduplicated-cond -Wlogical-op -Wmisleading-indentation>)
+      -Wduplicated-cond -Wlogical-op -Wmisleading-indentation>
+    # Its own genex because GCC has no -Wcomma and hard-errors on the flag.
+    $<$<CXX_COMPILER_ID:Clang,AppleClang>:
+      -Wcomma>)
   if(STILLS_WERROR)
     set_property(TARGET ${target} PROPERTY COMPILE_WARNING_AS_ERROR ON)
   endif()
