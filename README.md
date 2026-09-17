@@ -455,7 +455,7 @@ a handle does not cancel. Handlers must not throw, as with any `std::thread`.
   box cannot change after `open()` — the pixel format determines the converter.
 - `HardwarePolicy::automatic` is a static table, not a measurement: it cannot know that this
   machine's GPU beats its CPU, or the reverse. The pipeline already learns seek and per-frame costs
-  at runtime (`learn_costs`, feeding the seek-versus-decode-forward decision), and the NVDEC
+  at runtime (`SeekCostModel`, feeding the seek-versus-decode-forward decision), and the NVDEC
   pathology above is observable from this library's own `get_format` callback — counting
   renegotiations per seek would detect it on any device instead of naming codecs. That is the
   intended 1.0 answer; until then, `prefer_hardware` plus `active_decoder()` is the honest override.

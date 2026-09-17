@@ -205,8 +205,8 @@ class Pipeline {
   }
 
   /// Positions and selects the frame for `requested` without converting it (the frame stays owned
-  /// by the pipeline: held_ or the pending slot). Validates the request, maps the time
-  /// into stream ticks, applies the bounds policy and the tolerance window.
+  /// by the pipeline, in one of its FrameSlots). Validates the request, maps the time into stream
+  /// ticks, applies the bounds policy and the tolerance window.
   [[nodiscard]] std::expected<Selected, Error> select_for(Time requested, const RequestOptions& ro,
                                                           const CancelToken& token) {
     if (auto v = ro.validate(opt_.pixel_format); !v) return std::unexpected(std::move(v.error()));
@@ -494,7 +494,7 @@ class Pipeline {
     for (FrameSlot* slot : {&held_, &pending_, &corrupt_last_}) {
       auto fr2 = make_frame();
       if (!fr2) return std::unexpected(fr2.error());
-      slot->reset(std::move(*fr2));
+      slot->install(std::move(*fr2));
     }
     const DisplayTransform applied =
         opt_.apply_preferred_track_transform ? stream_.transform : DisplayTransform{};
@@ -1048,6 +1048,8 @@ class Pipeline {
       positioned_ = false;  // forces a seek in position_for()
     } else {
       // Best effort on a non-rewindable input: the demuxer is somewhere at or after the last frame.
+      // The one field carried across reset(): the rest of the frontier described a decoder state
+      // the flush above destroyed, but this one is still true of the source.
       positioned_ = true;
       landed_at_start_ = false;
       frontier.lastReceivedTs = last;

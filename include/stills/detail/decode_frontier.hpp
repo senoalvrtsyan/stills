@@ -10,12 +10,18 @@
 //
 // Everything in it is invalidated together, because a reposition makes all of it describe a place
 // the decoder no longer is. That is what reset() is, and why the fields are one struct rather than
-// eleven members.
+// twelve Pipeline members. One caller contradicts that on purpose: recover_after_interrupt()
+// carries lastReceivedTs across the reset, because a source that cannot be rewound really is still
+// at or after that frame. It is the only such exception and it says so at the call site.
+//
+// A struct, not a class: centralising invalidation is what this type is for, and no two fields
+// here have to agree with each other. FrameSlot is a class because two of its do.
 //
 // Not thread-safe: a Pipeline is single-threaded by contract (pipeline.hpp), and the frontier is
 // only ever touched by the thread running that pipeline's decode loop.
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <vector>
