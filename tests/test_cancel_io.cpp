@@ -13,14 +13,14 @@ using stills::Time;
 
 TEST_CASE("cancel: a live request after an interrupted one never reports cancelled",
           "[async][cancel][ts]") {
-  // Pipeline-level and deterministic: with a token that is already cancelled, the interrupt
+  // FramePipeline-level and deterministic: with a token that is already cancelled, the interrupt
   // callback fires inside the very first libavformat call of the request (the MPEG-TS seek's
   // binary search reads), which leaves AVIOContext at "EOF with error = AVERROR_EXIT".
   // counter_longgop.ts is the fixture B1 failed on: its long GOPs mean a cancelled request
   // has usually only read packets, so the interrupt lands in a read rather than in a seek.
   const char* file =
       GENERATE("counter_offset.ts", "counter_longgop.ts", "counter.mkv", "counter.mp4");
-  auto p = REQUIRE_OK(stills::detail::Pipeline::open(fixture(file).string(), sw_options()));
+  auto p = REQUIRE_OK(stills::detail::FramePipeline::open(fixture(file).string(), sw_options()));
   std::atomic<bool> cancelled{true};
   const stills::detail::CancelToken dead{&cancelled, nullptr};
   const stills::detail::CancelToken live{};
@@ -77,7 +77,8 @@ TEST_CASE("cancel: a cancelled request on a pipe leaves forward requests working
   const int fd = ::open(fixture("counter.mp4").c_str(), O_RDONLY);
   REQUIRE(fd >= 0);
   {
-    auto p = REQUIRE_OK(stills::detail::Pipeline::open("pipe:" + std::to_string(fd), sw_options()));
+    auto p =
+        REQUIRE_OK(stills::detail::FramePipeline::open("pipe:" + std::to_string(fd), sw_options()));
     CHECK_FALSE(p->info().seekable);
     std::atomic<bool> cancelled{true};
     const stills::detail::CancelToken dead{&cancelled, nullptr};

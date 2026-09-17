@@ -13,9 +13,9 @@
 //     than of this library, and unreproducible on the reviewer's machine.
 //   * One decoder thread. The counts below have to be reproducible run to run, and the comparison
 //     is between two revisions on one machine, not a throughput claim.
-//   * detail::Pipeline directly, not AssetImageGenerator: the async engine's queueing and thread
-//     handoff would be measured along with the decode, and none of it is being restructured.
-//     tests/test_cancel_io.cpp already drives the pipeline this way.
+//   * detail::FramePipeline directly, not AssetImageGenerator: the async engine's queueing and
+//     thread handoff would be measured along with the decode, and none of it is being
+//     restructured. tests/test_cancel_io.cpp already drives the pipeline this way.
 //   * Two request orders per case. `sweep` walks forward and is served largely by continuing from
 //     the held frame — the invariant the FrameSlot/DecodeFrontier extraction moves. `scatter` jumps
 //     and is served by the positioner. One order alone would leave half the restructure unmeasured.
@@ -24,7 +24,8 @@
 // the hour; the counts are a property of the code. A restructure that changes which seeks happen is
 // a behaviour change wearing a refactor's clothes, and it shows up here as a changed count long
 // before it shows up as a changed millisecond. Both counters already exist in the shipped library
-// for SeekCostModel and isForwardCheaperThanSeek(); this only reads them (Pipeline::getSeekCount).
+// for SeekCostModel and isForwardCheaperThanSeek(); this only reads them
+// (FramePipeline::getSeekCount).
 //
 // How to compare two revisions, because the milliseconds do not survive being compared across
 // sittings. These fixtures are small and a request costs tens of microseconds, so this column
@@ -35,11 +36,11 @@
 // into it, and run the two binaries alternately in one sitting, taking the median of several
 // rounds. Even then, treat a time difference under about 10% as nothing.
 //
-// Going *backwards* takes one more thing: Pipeline::getSeekCount and getDecodedFrameCount arrived
-// with this file, so a revision older than it has neither, and the file will not compile there
-// until the two accessors are dropped in as well. The pre-restructure baseline is therefore taken
-// from the revision that introduced this harness, not from the one before it -- that step changes
-// no library behaviour, so the two are the same asset to measure.
+// Going *backwards* takes one more thing: FramePipeline::getSeekCount and getDecodedFrameCount
+// arrived with this file, so a revision older than it has neither, and the file will not compile
+// there until the two accessors are dropped in as well. The pre-restructure baseline is therefore
+// taken from the revision that introduced this harness, not from the one before it -- that step
+// changes no library behaviour, so the two are the same asset to measure.
 //
 // One caveat on those counts, and it is the reason every case is run more than once. The
 // seek-versus-decode-forward decision is not purely structural: isForwardCheaperThanSeek() compares
@@ -167,7 +168,7 @@ struct Case {
   Run run;
 
   const auto openStart = Clock::now();
-  auto pipeline = stills::detail::Pipeline::open(fixturePath(fixture), options);
+  auto pipeline = stills::detail::FramePipeline::open(fixturePath(fixture), options);
   const auto openEnd = Clock::now();
   if (!pipeline) {
     std::cerr << "stills_bench: open(" << fixture << ") failed: " << pipeline.error() << "\n";

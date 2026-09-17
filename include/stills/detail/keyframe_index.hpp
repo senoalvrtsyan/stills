@@ -22,8 +22,8 @@
 // places every keyframe one reorder delay out, which looks like a working seek that lands a frame
 // early on half the files in the world.
 //
-// Not thread-safe: a Pipeline is single-threaded by contract (pipeline.hpp), and its KeyframeIndex
-// is only ever touched by the thread running that pipeline.
+// Not thread-safe: a FramePipeline is single-threaded by contract (pipeline.hpp), and its
+// KeyframeIndex is only ever touched by the thread running that pipeline.
 
 #include <algorithm>
 #include <cstdint>

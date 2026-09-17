@@ -22,8 +22,8 @@
 // flag and the packet are one thing: a packet is pending exactly when the reader is holding it
 // for a retry, and resetPosition() is the only other thing that may drop it.
 //
-// Not thread-safe: a Pipeline is single-threaded by contract (pipeline.hpp), and its PacketReader
-// is only ever touched by the thread running that pipeline.
+// Not thread-safe: a FramePipeline is single-threaded by contract (pipeline.hpp), and its
+// PacketReader is only ever touched by the thread running that pipeline.
 
 #include <algorithm>
 #include <cstdint>
@@ -98,11 +98,12 @@ class PacketReader {
   /// packet is a separate question it has no business answering.
   ///
   /// The distinction from releasePacket() is not cosmetic. At the keyframe-tail check
-  /// (Pipeline::verify_keyframe_tail) the flag can still be set from a send that returned EAGAIN,
-  /// over a packet this very loop has already overwritten. Clearing it there would be a behaviour
-  /// change, not a tidy-up: what makes that state safe is that the loop ends with
-  /// `positioned_ = false`, so the next request repositions and reset_position() clears the flag
-  /// before anything could send the packet. Do not collapse the two without moving that guarantee.
+  /// (FramePipeline::verify_keyframe_tail) the flag can still be set from a send that returned
+  /// EAGAIN, over a packet this very loop has already overwritten. Clearing it there would be a
+  /// behaviour change, not a tidy-up: what makes that state safe is that the loop ends with
+  /// `position_.markInvalid()`, so the next request repositions and reset_position() clears the
+  /// flag before anything could send the packet. Do not collapse the two without moving that
+  /// guarantee.
   void unrefPacket() noexcept { av_packet_unref(pkt.get()); }
 
   /// Whether the demuxer flags keyframe packets at all. Learned from the very first packet of the
@@ -186,8 +187,9 @@ class PacketReader {
   /// Two of its outcomes are the caller's to carry out and are returned rather than performed:
   /// `rewind` (a seek, which belongs to positioning) and `awaitKey` (the buffered GOP starts at
   /// the chosen keyframe, so the caller's positioning state must still say one is awaited).
-  /// Ignoring either would feed the decoder a mid-GOP packet stream. Pipeline::read_landing() is
-  /// the one caller and does both; anything else that calls this owes them too.
+  /// Ignoring either would feed the decoder a mid-GOP packet stream.
+  /// FramePipeline::read_landing() is the one caller and does both; anything else that calls this
+  /// owes them too.
   /// `scan == false` (trusted
   /// index): the first keyframe packet is the landing; it is held for the decoder when it
   /// is at or before P. `scan == true` (no index): keeps reading through the GOPs up to P, records

@@ -25,8 +25,9 @@
 // therefore cannot drift out of step with the calls, because it is incremented where they are
 // made. The benchmark harness gates on that number (tests/bench).
 //
-// Not thread-safe: a Pipeline is single-threaded by contract (pipeline.hpp), and its MediaSource is
-// only ever touched by the thread running that pipeline. The one exception is the interrupt
+// Not thread-safe: a FramePipeline is single-threaded by contract (pipeline.hpp), and its
+// MediaSource is only ever touched by the thread running that pipeline. The one exception is the
+// interrupt
 // callback, which libavformat calls on the same thread from inside the I/O it is blocking in.
 
 #include <algorithm>

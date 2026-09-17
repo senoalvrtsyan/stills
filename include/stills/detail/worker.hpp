@@ -34,7 +34,7 @@ namespace detail {
 /// callbacks hold pointers into it.
 struct Engine {
   Options options;
-  std::unique_ptr<Pipeline> pipeline;
+  std::unique_ptr<FramePipeline> pipeline;
   std::mutex decoder_mutex;  // serialises every use of `pipeline`
   std::atomic<int> sync_waiters{
       0};  // image_at() callers waiting for the decoder (served before the next async item)
@@ -67,7 +67,7 @@ struct Engine {
   std::latch start_gate{1};
   std::thread worker;  // last member: constructed after everything it touches
 
-  Engine(Options opt, std::unique_ptr<Pipeline> p)
+  Engine(Options opt, std::unique_ptr<FramePipeline> p)
       : options(std::move(opt)), pipeline(std::move(p)) {}
   Engine(const Engine&) = delete;
   Engine& operator=(const Engine&) = delete;
@@ -192,10 +192,10 @@ struct Engine {
         try {
           result = pipeline->image_at(t, batch->options, token);
         } catch (const std::bad_alloc&) {
-          // Pipeline::image_at() converts an allocation failure itself, because only it can put
-          // the decoder back into a defined state. This is the guard on the noexcept frame around
-          // it: reaching it would otherwise be std::terminate rather than one failed item. Only
-          // bad_alloc — an exception out of a user handler still terminates, as documented.
+          // FramePipeline::image_at() converts an allocation failure itself, because only it can
+          // put the decoder back into a defined state. This is the guard on the noexcept frame
+          // around it: reaching it would otherwise be std::terminate rather than one failed item.
+          // Only bad_alloc — an exception out of a user handler still terminates, as documented.
           result = std::unexpected(Error{ErrorCode::out_of_memory, 0, "out of memory"});
         }
         lk.unlock();

@@ -53,7 +53,7 @@ class AssetImageGenerator {
                                                                       Options options = {}) {
     if (auto v = check_source(source); !v) return std::unexpected(std::move(v.error()));
     if (auto v = options.validate(); !v) return std::unexpected(std::move(v.error()));
-    auto pipeline = detail::Pipeline::open(std::string{source}, options);
+    auto pipeline = detail::FramePipeline::open(std::string{source}, options);
     if (!pipeline) return std::unexpected(std::move(pipeline.error()));
     auto engine = std::make_shared<detail::Engine>(std::move(options), std::move(*pipeline));
 #if defined(__cpp_exceptions) && __cpp_exceptions

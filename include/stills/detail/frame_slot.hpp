@@ -12,12 +12,13 @@
 // Before this, the flags were set by hand in five places and agreed only by inspection.
 //
 // Precondition on every member but install(): the slot has been given its AVFrame.
-// Pipeline::attach_to_source() gives all three theirs before anything else can reach them and
+// FramePipeline::attach_to_source() gives all three theirs before anything else can reach them and
 // nothing takes one away, so this is a precondition the asserts name, not a case the members
 // branch on.
 //
-// Not thread-safe, and not meant to be: a Pipeline is single-threaded by contract (pipeline.hpp),
-// and a slot is only ever touched by the thread running that pipeline's decode loop.
+// Not thread-safe, and not meant to be: a FramePipeline is single-threaded by contract
+// (pipeline.hpp), and a slot is only ever touched by the thread running that pipeline's decode
+// loop.
 
 #include <cassert>
 #include <utility>
@@ -31,8 +32,9 @@ class FrameSlot {
   FrameSlot() = default;
   // Not movable, on purpose. A defaulted move would leave the source `valid` over a null frame —
   // the same two values disagreeing, in the one direction the accessors cannot report, since
-  // isValid() would say yes and getFrame() would hand back nullptr. Nothing moves a slot (Pipeline
-  // owns all three and is itself non-movable), so deleting it costs nothing and closes the hole by
+  // isValid() would say yes and getFrame() would hand back nullptr. Nothing moves a slot
+  // (FramePipeline owns all three and is itself non-movable), so deleting it costs nothing and
+  // closes the hole by
   // construction, which is the whole argument for this type.
   FrameSlot(FrameSlot&&) = delete;
   FrameSlot& operator=(FrameSlot&&) = delete;

@@ -314,7 +314,7 @@ message}`. `to_string`, `operator<<` and a `std::formatter` are provided; `error
 
 ```
 stills::AssetImageGenerator (move-only handle) ──shared_ptr──▶ detail::Engine (heap, never moves)
-   │ image_at(Time) ─── lock decoder_mutex ─────────────────▶ ├─ detail::Pipeline (all libav state)
+   │ image_at(Time) ─── lock decoder_mutex ─────────────────▶ ├─ detail::FramePipeline (all libav state)
    │ generate_images(times, handler) ── enqueue ────────────▶ ├─ deque<shared_ptr<Batch>> + cv
    │ cancel_all()                                            ├─ std::thread worker
    └─ AsyncRequest (copyable) ──shared_ptr──▶ detail::Batch   └─ per item: lock; image_at(t, token);

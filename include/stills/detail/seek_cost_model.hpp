@@ -17,7 +17,7 @@
 // Units are milliseconds throughout, and the clock is steady_clock. A zero cost means "not learned
 // yet" and callers check for it, which is why neither average is ever seeded with a guess.
 //
-// Not thread-safe: a Pipeline is single-threaded by contract (pipeline.hpp).
+// Not thread-safe: a FramePipeline is single-threaded by contract (pipeline.hpp).
 
 #include <algorithm>
 #include <chrono>
