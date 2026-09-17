@@ -2,8 +2,8 @@
 
 **A header-only C++23 `AVAssetImageGenerator` over FFmpeg.**
 
-`0.1.0` · MIT · developed and run against FFmpeg 6.1 on Linux, with hardware decode exercised on
-VAAPI only · no CI.
+`0.1.0` · MIT · developed on Linux against FFmpeg 6.1, suite also run against 7.1.2, 8.0 and
+9.0.1, with hardware decode exercised on VAAPI only · no CI.
 
 Extracts still frames from a video asset at requested times, synchronously or asynchronously with
 cancellation, modelled on Apple's `AVAssetImageGenerator`. Header-only C++23 over `libavformat` /
@@ -157,9 +157,9 @@ reference for every knob, including when you would want it.
 | | |
 |---|---|
 | Compiler | C++23 with `std::expected` and `__int128`: GCC 13+, Clang 17+ with libc++ 16+, Xcode 15+. **MSVC is not supported.** |
-| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and run here against 6.1 only; 7.x and 8.x are syntax-checked, never executed. |
+| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and the full suite run here against **6.1** (libavformat 60), **7.1.2** (61), **8.0** (62) and **9.0.1** (63) — 121/121 on each, hardware decode included. One recovery path — clearing libavio's sticky error state after a cancelled read — pokes `AVIOContext` fields directly and is enabled only for those four majors; on any other it is skipped and a rewindable source is re-opened instead, costing one extra re-open per interrupt recovery rather than failing the build. On a non-rewindable source (a pipe) there is nothing to re-open and the interrupted read still fails — the same outcome as before, minus the build failure. |
 | Build | CMake ≥ 3.25 and `Threads`. **Every preset specifies the Ninja generator**, so install `ninja` or configure by hand with `-G`. Catch2 v3.16.0 is fetched at configure time unless `find_package(Catch2 3)` finds one. |
-| Standard | A top-level build pins `CMAKE_CXX_STANDARD 23`, `..._REQUIRED ON`, `..._EXTENSIONS OFF`, and sets `CXX_STANDARD 23` on the fetched Catch2 targets: Catch2 asks only for `cxx_std_14`, and at the compiler's default it does not link against C++23 test TUs on Apple Clang 17. A consumer's settings are untouched. |
+| Standard | A top-level build pins `CMAKE_CXX_STANDARD 23`, `..._REQUIRED ON`, `..._EXTENSIONS OFF`, and sets `CXX_STANDARD 23` on the fetched Catch2 targets. CMake otherwise leaves Catch2 (`cxx_std_14`) at the compiler's default, and a standard mismatch makes our C++23 test TUs reference `StringMaker` specialisations Catch2 never emitted — the reported Apple Clang 17 link failure. Reproduced here only at C++14-vs-C++23; at C++17-vs-C++23 the symbol surface is identical on libstdc++, so **the Apple Clang mechanism itself is unverified — there is no Apple toolchain on this machine.** A consumer's settings are untouched. |
 | Fixtures | An `ffmpeg` **binary** (6.0+, for `-display_rotation` and `-fps_mode`) with `libx264`, and `python3` for one clip — which falls back to `tr` when absent. `libvpx-vp9` and `libx265` are optional; their tests skip themselves. |
 
 ```sh

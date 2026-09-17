@@ -7,12 +7,14 @@ FetchContent_Declare(Catch2
   FIND_PACKAGE_ARGS 3)
 FetchContent_MakeAvailable(Catch2)
 # Catch2 asks for cxx_std_14 only, so left alone it builds at the compiler's default while our TUs
-# are at C++23 -- the mismatch that breaks the link on Apple Clang 17. A top-level build already
-# pins CMAKE_CXX_STANDARD; this covers the consumer who builds our tests as a subproject.
-# Guarded, because with FIND_PACKAGE_ARGS above a system Catch2 wins and provides IMPORTED targets
-# (Catch2::Catch2*) instead, on which CXX_STANDARD does nothing -- see the README caveat.
+# are at C++23 -- the mismatch behind the reported Apple Clang 17 link failure. A top-level build
+# already pins CMAKE_CXX_STANDARD; this covers the consumer who builds our tests as a subproject.
+# Guarded, because with FIND_PACKAGE_ARGS above a system Catch2 wins and exports only namespaced
+# IMPORTED targets (Catch2::Catch2*), so set_target_properties(Catch2 ...) is a hard CMake error
+# ("Can not find target to add properties to") -- and would do nothing on an IMPORTED target
+# anyway. See the README caveat.
 if(TARGET Catch2 AND TARGET Catch2WithMain)
-  set_target_properties(Catch2 Catch2WithMain PROPERTIES CXX_STANDARD 23)
+  set_target_properties(Catch2 Catch2WithMain PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
 endif()
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)

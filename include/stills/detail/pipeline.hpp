@@ -277,7 +277,11 @@ class Pipeline {
                     "the generator is unusable: " + broken_reason_);
       }
     }
-    recover_after_interrupt();
+    if (!recover_after_interrupt()) {
+      // The interrupt left libavio's state stuck and this libavformat major is not one
+      // tryResetIoState() can clear (see there): re-open instead of reading through it.
+      if (auto r = reopen(); !r) return std::unexpected(std::move(r.error()));
+    }
     eof_retried_ = false;  // one re-position per attempt (a hardware fallback retries the request)
     return extract(target, lo, hi, clamped, token);
   }
@@ -1018,15 +1022,23 @@ class Pipeline {
   /// short read into AVERROR_EOF, and a later seek clears `error` but not `eof_reached`, which on
   /// its own is indistinguishable from a genuine EOF. So the interrupt is recorded when it fires
   /// (interrupt_callback) rather than inferred here, and consumed either way.
-  void recover_after_interrupt() noexcept {
+  ///
+  /// Returns false when the sticky state could not be cleared in place -- a libavformat major
+  /// tryResetIoState() was never verified against -- and the source can be re-opened. The caller
+  /// must then re-establish it before the next read; nothing else clears the I/O layer.
+  [[nodiscard]] bool recover_after_interrupt() noexcept {
     const bool fired = std::exchange(interrupt_fired_, false);
-    if (!fmt_ || fmt_->pb == nullptr) return;
-    if (fmt_->pb->error != k::exit_requested && !(fired && fmt_->pb->eof_reached != 0)) return;
-    reset_io_state(*fmt_->pb);
+    if (!fmt_ || fmt_->pb == nullptr) return true;
+    if (fmt_->pb->error != k::exit_requested && !(fired && fmt_->pb->eof_reached != 0)) return true;
+    const bool cleared = tryResetIoState(*fmt_->pb);
     const std::int64_t last = last_received_ts_;
     avformat_flush(fmt_.get());
     if (codec_) avcodec_flush_buffers(codec_.get());
     reset_position();
+    if (!cleared && stream_.io_seekable) {
+      positioned_ = false;  // nothing here can unstick the I/O layer; the caller re-opens
+      return false;
+    }
     if (stream_.seekable) {
       positioned_ = false;  // forces a seek in position_for()
     } else {
@@ -1035,13 +1047,21 @@ class Pipeline {
       landed_at_start_ = false;
       last_received_ts_ = last;
     }
+    return true;
   }
 
   /// Re-positions for `P` after an end of stream that produced no frames at all. libavio's sticky
-  /// end-of-file is cleared first: a seek leaves it set, so the retry would read EOF again.
+  /// end-of-file is cleared first: a seek leaves it set, so the retry would read EOF again. On a
+  /// libavformat major where it cannot be cleared in place, the source is re-opened instead.
   [[nodiscard]] std::expected<void, Error> retry_after_empty_eof(std::int64_t P,
                                                                  const CancelToken& token) {
-    if (fmt_ && fmt_->pb != nullptr) reset_io_state(*fmt_->pb);
+    if (fmt_ && fmt_->pb != nullptr && !tryResetIoState(*fmt_->pb) && stream_.io_seekable) {
+      // An unverified libavformat major: the sticky end-of-file survives a seek, so the source is
+      // re-established rather than retried in place. Slower by one re-open, and correct.
+      reset_position();
+      if (auto r = reopen(); !r) return r;
+      return position_for(P, keyframe_only_, token);
+    }
     avformat_flush(fmt_.get());
     if (codec_) avcodec_flush_buffers(codec_.get());
     reset_position();
@@ -1499,21 +1519,28 @@ class Pipeline {
   }
 
   /// Clears libavio's sticky end-of-file / error state so reading can continue after an interrupt
-  /// inside a read. Poking `eof_reached` / `error` is not promised to keep the
-  /// demuxer consistent, so it is confined to the libavformat majors it was verified against
-  /// (60 = 6.1, 61 = 7.x, 62 = 8.x); a newer major uses avio_seek, which clears eof_reached.
-  static void reset_io_state(AVIOContext& pb) noexcept {
-#if LIBAVFORMAT_VERSION_MAJOR <= 62
+  /// inside a read. Poking `eof_reached` / `error` is not promised to keep the demuxer consistent,
+  /// so it is confined to the libavformat majors it was verified against -- 60 (FFmpeg 6.1),
+  /// 61 (7.1), 62 (8.0) and 63 (9.0), each one built and the suite run against it. On any other
+  /// major it changes nothing and returns false; the caller re-establishes the source instead,
+  /// which costs one re-open per interrupt recovery. That is the right trade against failing the
+  /// build, which would stop every consumer -- including the ones that never cancel -- over a
+  /// path they never reach.
+  ///
+  /// Why an unknown major cannot simply seek instead: a same-position avio_seek clears
+  /// `eof_reached` but leaves `error` set -- `s->eof_reached = 0` on every exit path, `s->error`
+  /// never assigned; read from source at n7.1.2 / n8.0 / n9.0.1 (avio_seek itself changed in 9,
+  /// this property did not) and confirmed behaviourally at 60 by the suite. And avio_read returns
+  /// `s->error` whenever it read nothing, while the case this function exists for is exactly
+  /// `pb->error == AVERROR_EXIT` -- so seeking alone would leave every later read failing.
+  [[nodiscard]] static bool tryResetIoState(AVIOContext& pb) noexcept {
+#if LIBAVFORMAT_VERSION_MAJOR <= 63
     pb.eof_reached = 0;
     pb.error = 0;
+    return true;
 #else
-    // Reaching here means a libavformat major this was never read against. A same-position
-    // avio_seek clears eof_reached, but avio_read returns s->error unconditionally while it is
-    // set, and the case this function exists for is exactly `pb->error == AVERROR_EXIT` — so this
-    // fallback would leave every later read failing. Verify the recovery on that version and move
-    // the major into the branch above.
-#error "verify AVIOContext recovery (eof_reached / error) on this libavformat major before enabling"
-    (void)avio_seek(&pb, avio_tell(&pb), SEEK_SET);
+    (void)pb;
+    return false;
 #endif
   }
 
