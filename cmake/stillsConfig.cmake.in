@@ -4,7 +4,7 @@ include(CMakeFindDependencyMacro)
 
 # Header-only, but the headers include libav's, so a consumer still needs its flags. The exported
 # target names PkgConfig::FFMPEG, so recreate exactly that target — unless the consumer already has.
-# The bounds match the static_asserts in detail/ffmpeg.hpp (FFmpeg 6.1) and the top-level
+# The bounds match the static_asserts in detail/stills_FFmpeg.h (FFmpeg 6.1) and the top-level
 # CMakeLists.txt. Keep all three in step: with only the major versions here, a consumer on FFmpeg
 # 6.0 finds the package cleanly and then fails mid-compile on a static_assert, which is a much
 # worse error than one from pkg-config.

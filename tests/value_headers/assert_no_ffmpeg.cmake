@@ -20,6 +20,6 @@ if(STILLS_LIBAV_HEADERS)
   file(REMOVE "${DEPFILE}")
   message(FATAL_ERROR
     "a value header reached a libav header:\n    ${STILLS_LIBAV_LIST}\n"
-    "asset_info/error/geometry/options/pixel_format/time/version must depend on "
-    "detail/ffmpeg.hpp through nothing. See README, 'Design decisions'.")
+    "stills_AssetInfo/stills_Error/stills_Geometry/stills_Options/stills_PixelFormat/stills_Time/stills_Version must depend on "
+    "detail/stills_FFmpeg.h through nothing. See README, 'Design decisions'.")
 endif()

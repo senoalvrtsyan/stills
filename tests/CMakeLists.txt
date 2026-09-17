@@ -119,12 +119,12 @@ stills_apply_warnings(stills_value_headers)
 # The target above proves the seven compile standalone; it does not prove they reached no libav
 # header. The #error in the TU is a five-macro blocklist and cannot be completed: about fifty public
 # libav headers define none of the five, libavutil/display.h among them -- which is exactly the one
-# geometry.hpp would reach for if anyone wanted av_display_rotation_get here. Verified by adding
-# that include to geometry.hpp: stills_value_headers compiled green. So the property is tested here
+# stills_Geometry.h would reach for if anyone wanted av_display_rotation_get here. Verified by adding
+# that include to stills_Geometry.h: stills_value_headers compiled green. So the property is tested here
 # instead, against the dependency list the preprocessor produced, which no macro can hide from and
 # which does not depend on the include directory having been withheld. The #error stays as the cheap
 # first line: no second compiler invocation, and it names the offending file in the diagnostic.
-# GCC/Clang only, matching stills_warnings.cmake: detail/config.hpp hard-errors without __int128,
+# GCC/Clang only, matching stills_warnings.cmake: detail/stills_Config.h hard-errors without __int128,
 # so an MSVC branch here could never run.
 if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   set(STILLS_VALUE_HEADER_DEPS ${CMAKE_CURRENT_BINARY_DIR}/value_headers.deps)
@@ -132,7 +132,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     OUTPUT ${STILLS_VALUE_HEADER_DEPS}
     # -M, not -MM: -MM drops headers found in system directories, and libav's prefix is one of those
     # on this machine -- the very case this check exists for. Same -std as the target above, because
-    # error.hpp and time.hpp select their <format> include on the language level.
+    # stills_Error.h and stills_Time.h select their <format> include on the language level.
     COMMAND ${CMAKE_CXX_COMPILER} -std=c++23 -I${PROJECT_SOURCE_DIR}/include -M
             -MF ${STILLS_VALUE_HEADER_DEPS}
             ${CMAKE_CURRENT_SOURCE_DIR}/value_headers/value_headers.cpp
@@ -143,14 +143,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     # includes in value_headers.cpp.
     DEPENDS value_headers/value_headers.cpp
             value_headers/assert_no_ffmpeg.cmake
-            ${PROJECT_SOURCE_DIR}/include/stills/asset_info.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/error.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/geometry.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/options.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/pixel_format.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/time.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/version.hpp
-            ${PROJECT_SOURCE_DIR}/include/stills/detail/config.hpp
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_AssetInfo.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_Error.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_Geometry.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_Options.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_PixelFormat.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_Time.h
+            ${PROJECT_SOURCE_DIR}/include/stills/stills_Version.h
+            ${PROJECT_SOURCE_DIR}/include/stills/detail/stills_Config.h
     COMMENT "Checking that the value headers reach no libav header"
     VERBATIM)
   add_custom_target(stills_value_headers_check ALL DEPENDS ${STILLS_VALUE_HEADER_DEPS})

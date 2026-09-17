@@ -1,5 +1,5 @@
  # Strict warning set applied to *our* executables only (never to the INTERFACE library target,
-# so consumers are not forced into our flags). GCC/Clang only: detail/config.hpp hard-errors
+# so consumers are not forced into our flags). GCC/Clang only: detail/stills_Config.h hard-errors
 # without __int128, which MSVC does not have, so an MSVC branch here could never run.
 function(stills_apply_warnings target)
   target_compile_options(${target} PRIVATE

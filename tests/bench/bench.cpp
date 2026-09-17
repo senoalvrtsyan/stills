@@ -44,7 +44,7 @@
 //
 // One caveat on those counts, and it is the reason every case is run more than once. The
 // seek-versus-decode-forward decision is not purely structural: isForwardCheaperThanSeek() compares
-// `frames_to_key * frameCostMs` against `seekCostMs`, and both are exponential averages of
+// `framesToKey * frameCostMs` against `seekCostMs`, and both are exponential averages of
 // measured wall-clock time. A request sitting near that boundary can go either way on a loaded
 // machine. So each case is run `--reps` times from a fresh pipeline, and a count that is not
 // identical across all reps is printed as `a|b|c` rather than a single number. Those cases are the
@@ -60,10 +60,11 @@
 #include <string_view>
 #include <vector>
 
-#include <stills/detail/pipeline.hpp>
-#include <stills/stills.hpp>
+#include <stills/detail/stills_FramePipeline.h>
+#include <stills/stills_Stills.h>
 
-namespace {
+namespace
+{
 
 using Clock = std::chrono::steady_clock;
 
@@ -71,216 +72,279 @@ constexpr std::string_view fixtures[] = {
     // An MP4 with a trusted index, a long-GOP MPEG-TS that has to scan, a Matroska, and 10-bit
     // HEVC — one file for each positioning strategy the pipeline can take, plus one that makes the
     // per-frame conversion cost visible.
-    "counter.mp4", "counter_longgop.ts", "counter.mkv", "counter_p10.mp4",
+    "counter.mp4",
+    "counter_longgop.ts",
+    "counter.mkv",
+    "counter_p10.mp4",
 };
 
-struct Mode {
-  std::string_view name;
-  stills::Tolerance tolerance;
+struct Mode
+{
+    std::string_view name;
+    stills::Tolerance tolerance;
 };
 
 const Mode modes[] = {
-    {"exact", stills::Tolerance::exact()},
-    {"keyframe", stills::Tolerance::any()},
+    { "exact", stills::Tolerance::exact() },
+    { "keyframe", stills::Tolerance::any() },
 };
 
 /// Ascending: 0, 1, 2, ... Served by continuing from the held frame wherever the pipeline can.
-std::vector<int> sweepOrder(int n) {
-  std::vector<int> out(static_cast<std::size_t>(n));
-  for (int i = 0; i < n; ++i) out[static_cast<std::size_t>(i)] = i;
-  return out;
+std::vector<int> sweepOrder (int n)
+{
+    std::vector<int> out (static_cast<std::size_t> (n));
+
+    for (int i = 0; i < n; ++i)
+        out[static_cast<std::size_t> (i)] = i;
+    return out;
 }
 
 /// Bit-reversed over the next power of two, dropping what falls past `n`: a deterministic,
 /// RNG-free permutation that is spread over the whole asset and jumps both ways every step.
-std::vector<int> scatterOrder(int n) {
-  int bits = 1;
-  while ((1 << bits) < n) ++bits;
-  std::vector<int> out;
-  out.reserve(static_cast<std::size_t>(n));
-  for (int i = 0; i < (1 << bits); ++i) {
-    int r = 0;
-    for (int b = 0; b < bits; ++b) {
-      if ((i & (1 << b)) != 0) r |= 1 << (bits - 1 - b);
+std::vector<int> scatterOrder (int n)
+{
+    int bits = 1;
+
+    while ((1 << bits) < n)
+        ++bits;
+    std::vector<int> out;
+    out.reserve (static_cast<std::size_t> (n));
+
+    for (int i = 0; i < (1 << bits); ++i)
+    {
+        int r = 0;
+
+        for (int b = 0; b < bits; ++b)
+        {
+            if ((i & (1 << b)) != 0) r |= 1 << (bits - 1 - b);
+        }
+
+        if (r < n) out.push_back (r);
     }
-    if (r < n) out.push_back(r);
-  }
-  return out;
+
+    return out;
 }
 
-struct Order {
-  std::string_view name;
-  std::vector<int> (*build)(int);
+struct Order
+{
+    std::string_view name;
+    std::vector<int> (*build) (int);
 };
 
-const Order orders[] = {{"sweep", &sweepOrder}, {"scatter", &scatterOrder}};
+const Order orders[] = { { "sweep", &sweepOrder }, { "scatter", &scatterOrder } };
 
 /// One run of one case from a fresh pipeline.
-struct Run {
-  double openMs{0};
-  double requestMs{0};  ///< summed over every request, open excluded
-  long seeks{0};
-  long framesDecoded{0};
+struct Run
+{
+    double openMs{ 0 };
+    double requestMs{ 0 }; ///< summed over every request, open excluded
+    long seeks{ 0 };
+    long framesDecoded{ 0 };
 };
 
 /// Every rep of one case. Times are summarised by the median; counts are reported per rep, because
 /// a count that moves is the thing worth seeing, not a count that averages.
-struct Case {
-  std::string_view fixture;
-  std::string_view mode;
-  std::string_view order;
-  std::vector<Run> runs;
+struct Case
+{
+    std::string_view fixture;
+    std::string_view mode;
+    std::string_view order;
+    std::vector<Run> runs;
 };
 
-[[nodiscard]] double median(std::vector<double> v) {
-  std::sort(v.begin(), v.end());
-  return v[v.size() / 2];
+[[nodiscard]] double median (std::vector<double> v)
+{
+    std::sort (v.begin(), v.end());
+    return v[v.size() / 2];
 }
 
 /// "12" when every rep agreed, "12|13|12" when they did not.
-[[nodiscard]] std::string counts(const std::vector<Run>& runs, long Run::* field) {
-  const bool stable = std::ranges::all_of(
-      runs, [&](const Run& r) { return r.*field == runs.front().*field; });
-  if (stable) return std::to_string(runs.front().*field);
-  std::string s;
-  for (const Run& r : runs) {
-    if (!s.empty()) s += '|';
-    s += std::to_string(r.*field);
-  }
-  return s;
+[[nodiscard]] std::string counts (const std::vector<Run>& runs, long Run::* field)
+{
+    const bool stable = std::ranges::all_of (runs, [&] (const Run& r) { return r.*field == runs.front().*field; });
+
+    if (stable) return std::to_string (runs.front().*field);
+    std::string s;
+
+    for (const Run& r : runs)
+    {
+        if (! s.empty()) s += '|';
+        s += std::to_string (r.*field);
+    }
+
+    return s;
 }
 
-[[nodiscard]] std::string fixturePath(std::string_view name) {
-  return std::string{STILLS_FIXTURE_DIR} + "/" + std::string{name};
+[[nodiscard]] std::string fixturePath (std::string_view name)
+{
+    return std::string{ STILLS_FIXTURE_DIR } + "/" + std::string{ name };
 }
 
 /// Opens the asset, issues `order.size()` requests at times spread over its duration, and returns
 /// what that cost. `requested[i] = duration * order[i] / count`, so the last request stays inside
 /// the asset and OutOfRangePolicy::error never fires.
-[[nodiscard]] Run runOnce(std::string_view fixture, const Mode& mode,
-                          const std::vector<int>& order) {
-  stills::Options options;
-  options.hardware.policy = stills::HardwarePolicy::software_only;
-  options.tolerance = mode.tolerance;
-  options.decoder_threads = 1;
+[[nodiscard]] Run runOnce (std::string_view fixture, const Mode& mode, const std::vector<int>& order)
+{
+    stills::Options options;
+    options.hardware.policy = stills::HardwarePolicy::softwareOnly;
+    options.tolerance = mode.tolerance;
+    options.decoderThreads = 1;
 
-  const stills::detail::CancelToken token;
-  Run run;
+    const stills::detail::CancelToken token;
+    Run run;
 
-  const auto openStart = Clock::now();
-  auto pipeline = stills::detail::FramePipeline::open(fixturePath(fixture), options);
-  const auto openEnd = Clock::now();
-  if (!pipeline) {
-    std::cerr << "stills_bench: open(" << fixture << ") failed: " << pipeline.error() << "\n";
-    std::exit(1);
-  }
-  run.openMs = std::chrono::duration<double, std::milli>(openEnd - openStart).count();
+    const auto openStart = Clock::now();
+    auto pipeline = stills::detail::FramePipeline::open (fixturePath (fixture), options);
+    const auto openEnd = Clock::now();
 
-  const auto duration = (*pipeline)->info().duration;
-  if (!duration || !duration->is_finite()) {
-    std::cerr << "stills_bench: " << fixture << " declares no usable duration\n";
-    std::exit(1);
-  }
-  const std::int64_t span = duration->value();
-  const auto count = static_cast<std::int64_t>(order.size());
-
-  for (const int index : order) {
-    const stills::Time requested{span * index / count, duration->timescale()};
-    const auto start = Clock::now();
-    auto image = (*pipeline)->image_at(requested, token);
-    const auto end = Clock::now();
-    if (!image) {
-      std::cerr << "stills_bench: " << fixture << " image_at(" << stills::to_string(requested)
-                << ") failed: " << image.error() << "\n";
-      std::exit(1);
+    if (! pipeline)
+    {
+        std::cerr << "stills_bench: open(" << fixture << ") failed: " << pipeline.error() << "\n";
+        std::exit (1);
     }
-    run.requestMs += std::chrono::duration<double, std::milli>(end - start).count();
-    run.seeks += (*pipeline)->getSeekCount();
-    run.framesDecoded += (*pipeline)->getDecodedFrameCount();
-  }
-  return run;
+
+    run.openMs = std::chrono::duration<double, std::milli> (openEnd - openStart).count();
+
+    const auto duration = (*pipeline)->getInfo().duration;
+
+    if (! duration || ! duration->isFinite())
+    {
+        std::cerr << "stills_bench: " << fixture << " declares no usable duration\n";
+        std::exit (1);
+    }
+
+    const std::int64_t span = duration->getValue();
+    const auto count = static_cast<std::int64_t> (order.size());
+
+    for (const int index : order)
+    {
+        const stills::Time requested{ span * index / count, duration->getTimescale() };
+        const auto start = Clock::now();
+        auto image = (*pipeline)->imageAt (requested, token);
+        const auto end = Clock::now();
+
+        if (! image)
+        {
+            std::cerr << "stills_bench: " << fixture << " imageAt(" << stills::toString (requested)
+                      << ") failed: " << image.error() << "\n";
+            std::exit (1);
+        }
+
+        run.requestMs += std::chrono::duration<double, std::milli> (end - start).count();
+        run.seeks += (*pipeline)->getSeekCount();
+        run.framesDecoded += (*pipeline)->getDecodedFrameCount();
+    }
+
+    return run;
 }
 
-void report(const std::vector<Case>& cases, int requests) {
-  std::cout << std::format("\n{:<20} {:<9} {:<8} {:>9} {:>9} {:>10} {:>12}\n", "fixture", "mode",
-                           "order", "open ms", "ms/req", "seeks", "frames")
-            << std::string(82, '-') << "\n";
-  double totalMs = 0;
-  long totalSeeks = 0;
-  long totalFrames = 0;
-  for (const Case& c : cases) {
-    std::vector<double> openMs;
-    std::vector<double> perRequest;
-    for (const Run& r : c.runs) {
-      openMs.push_back(r.openMs);
-      perRequest.push_back(r.requestMs / requests);
+void report (const std::vector<Case>& cases, int requests)
+{
+    std::cout << std::format ("\n{:<20} {:<9} {:<8} {:>9} {:>9} {:>10} {:>12}\n", "fixture", "mode", "order", "open ms",
+                              "ms/req", "seeks", "frames")
+              << std::string (82, '-') << "\n";
+    double totalMs = 0;
+    long totalSeeks = 0;
+    long totalFrames = 0;
+
+    for (const Case& c : cases)
+    {
+        std::vector<double> openMs;
+        std::vector<double> perRequest;
+
+        for (const Run& r : c.runs)
+        {
+            openMs.push_back (r.openMs);
+            perRequest.push_back (r.requestMs / requests);
+        }
+
+        const double medianPerRequest = median (perRequest);
+        std::cout << std::format ("{:<20} {:<9} {:<8} {:>9.2f} {:>9.3f} {:>10} {:>12}\n", c.fixture, c.mode, c.order,
+                                  median (openMs), medianPerRequest, counts (c.runs, &Run::seeks),
+                                  counts (c.runs, &Run::framesDecoded));
+        totalMs += medianPerRequest;
+        totalSeeks += c.runs.front().seeks;
+        totalFrames += c.runs.front().framesDecoded;
     }
-    const double medianPerRequest = median(perRequest);
-    std::cout << std::format("{:<20} {:<9} {:<8} {:>9.2f} {:>9.3f} {:>10} {:>12}\n", c.fixture,
-                             c.mode, c.order, median(openMs), medianPerRequest,
-                             counts(c.runs, &Run::seeks), counts(c.runs, &Run::framesDecoded));
-    totalMs += medianPerRequest;
-    totalSeeks += c.runs.front().seeks;
-    totalFrames += c.runs.front().framesDecoded;
-  }
-  // The times are summed, not averaged: one number per revision to compare, with the same weight
-  // on every case. The counts are rep 1's, which is all of them whenever nothing printed `a|b|c`.
-  std::cout << std::string(82, '-') << "\n"
-            << std::format("{:<39} {:>19.3f} {:>10} {:>12}\n", "sum over all cases", totalMs,
-                           totalSeeks, totalFrames);
+
+    // The times are summed, not averaged: one number per revision to compare, with the same weight
+    // on every case. The counts are rep 1's, which is all of them whenever nothing printed `a|b|c`.
+    std::cout << std::string (82, '-') << "\n"
+              << std::format ("{:<39} {:>19.3f} {:>10} {:>12}\n", "sum over all cases", totalMs, totalSeeks,
+                              totalFrames);
 }
 
-}  // namespace
+} // namespace
 
-int main(int argc, char** argv) {
-  int reps = 3;
-  int requests = 40;
-  for (int i = 1; i < argc; ++i) {
-    const std::string_view arg{argv[i]};
-    const auto value = [&]() -> int {
-      if (i + 1 >= argc) {
-        std::cerr << "stills_bench: " << arg << " needs a value\n";
-        std::exit(2);
-      }
-      return std::atoi(argv[++i]);
-    };
-    if (arg == "--reps") {
-      reps = value();
-    } else if (arg == "--requests") {
-      requests = value();
-    } else {
-      std::cerr << "usage: stills_bench [--reps N] [--requests N]\n";
-      return 2;
+int main (int argc, char** argv)
+{
+    int reps = 3;
+    int requests = 40;
+
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string_view arg{ argv[i] };
+        const auto value = [&]() -> int
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "stills_bench: " << arg << " needs a value\n";
+                std::exit (2);
+            }
+
+            return std::atoi (argv[++i]);
+        };
+
+        if (arg == "--reps")
+        {
+            reps = value();
+        }
+        else if (arg == "--requests")
+        {
+            requests = value();
+        }
+        else
+        {
+            std::cerr << "usage: stills_bench [--reps N] [--requests N]\n";
+            return 2;
+        }
     }
-  }
-  if (reps < 1 || requests < 2) {
-    std::cerr << "stills_bench: --reps must be >= 1 and --requests >= 2\n";
-    return 2;
-  }
 
-  stills::set_log_level(stills::LogLevel::quiet);
+    if (reps < 1 || requests < 2)
+    {
+        std::cerr << "stills_bench: --reps must be >= 1 and --requests >= 2\n";
+        return 2;
+    }
 
-  std::cout << std::format(
-      "stills_bench: {} build, software only, 1 decoder thread, {} reps x {} requests\n"
-      "counts are per rep; `a|b|c` means the reps disagreed (see the header comment)\n",
+    stills::setLogLevel (stills::LogLevel::quiet);
+
+    std::cout << std::format ("stills_bench: {} build, software only, 1 decoder thread, {} reps x {} requests\n"
+                              "counts are per rep; `a|b|c` means the reps disagreed (see the header comment)\n",
 #ifdef NDEBUG
-      "release",
+                              "release",
 #else
-      "debug",
+                              "debug",
 #endif
-      reps, requests);
+                              reps, requests);
 
-  std::vector<Case> cases;
-  for (const std::string_view fixture : fixtures) {
-    for (const Mode& mode : modes) {
-      for (const Order& order : orders) {
-        const std::vector<int> indices = order.build(requests);
-        Case c{fixture, mode.name, order.name, {}};
-        for (int rep = 0; rep < reps; ++rep) c.runs.push_back(runOnce(fixture, mode, indices));
-        cases.push_back(std::move(c));
-      }
+    std::vector<Case> cases;
+
+    for (const std::string_view fixture : fixtures)
+    {
+        for (const Mode& mode : modes)
+        {
+            for (const Order& order : orders)
+            {
+                const std::vector<int> indices = order.build (requests);
+                Case c{ fixture, mode.name, order.name, {} };
+
+                for (int rep = 0; rep < reps; ++rep)
+                    c.runs.push_back (runOnce (fixture, mode, indices));
+                cases.push_back (std::move (c));
+            }
+        }
     }
-  }
-  report(cases, requests);
-  return 0;
+
+    report (cases, requests);
+    return 0;
 }

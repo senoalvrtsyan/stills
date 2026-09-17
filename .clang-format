@@ -2,9 +2,36 @@
 # re-wrapping and comment alignment differ slightly between major versions, so a much older
 # clang-format may report a handful of violations on an otherwise clean tree. Reformat with the
 # version you have, or pin one in CI; do not widen ColumnLimit to make a diff go away.
-BasedOnStyle: Google
-ColumnLimit: 100
-IndentWidth: 2
-DerivePointerAlignment: false
+#
+# This encodes the house C++ guidelines. Three of their rules cannot be expressed here and are
+# maintained by hand: a blank line before an `if`/`for`/`while`/`do` that follows another
+# statement, a blank line after a closing `}` unless the next line is also a brace, and `?`/`:`
+# aligned under each other in a wrapped ternary.
+BasedOnStyle: LLVM
+IndentWidth: 4
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -4
+BreakBeforeBraces: Allman
+# The guidelines want `foo (123)` but `foo()` -- a space only before parentheses that have
+# something in them. `SpaceBeforeParens: Always` would also write `foo ()`, which they call out
+# as wrong, so this is the Custom form rather than Always.
+SpaceBeforeParens: Custom
+SpaceBeforeParensOptions:
+  BeforeNonEmptyParentheses: true
+SpaceAfterLogicalNot: true                # ! foo
+SpaceAfterTemplateKeyword: true           # template <typename T>
+SpacesInAngles: Never                     # vector<int>
+AlignAfterOpenBracket: Align              # continuation at the column after "( "
+BreakBeforeBinaryOperators: NonAssignment # operator leads the continuation line
+BreakConstructorInitializers: BeforeColon
+ConstructorInitializerIndentWidth: 2      # "  : member (42)"
+BreakInheritanceList: BeforeColon
+Cpp11BracedListStyle: false               # { "key", value }
 PointerAlignment: Left
+DerivePointerAlignment: false
 AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AlwaysBreakTemplateDeclarations: Yes
+NamespaceIndentation: None
+FixNamespaceComments: true

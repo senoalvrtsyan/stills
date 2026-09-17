@@ -1,0 +1,19 @@
+# Commits that changed formatting, names or filenames across the whole tree and nothing else.
+# `git blame` skips them, so a line's blame still points at the commit that wrote the code
+# rather than at the pass that reformatted or renamed it.
+#
+# Enable once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# One full-length SHA per line. Add a commit here only if it is provably mechanical. For the
+# three passes below the evidence was: the token stream of every source file (comments stripped,
+# whitespace normalised, string literals preserved exactly) has the same length before and after,
+# with every difference an identifier or a string literal; and the Release binaries' .text
+# sections are byte-identical across the reformat alone. The reformat is the only one of the
+# three where .text can be compared directly -- renaming changes message strings, which moves
+# .rodata and shifts every address -- so for the rename passes the token-stream identity is the
+# evidence.
+
+# Reformat to the new .clang-format (LLVM/4-space/120/Allman), the house naming convention and
+# the project_ClassName.h filename convention -- steps 13-15 of the review revision.
