@@ -116,6 +116,15 @@ class Pipeline {
   }
   [[nodiscard]] const Options& options() const noexcept { return opt_; }
 
+  // Seeks and decoded frames attributable to the request that just returned: cur_ is reset at the
+  // top of image_at() and nowhere else. Both counters are maintained for learn_costs() and
+  // forward_is_cheaper(), so reading them adds no work to the decode path and a build that never
+  // calls these pays nothing. The benchmark harness (tests/bench) uses them to check that a
+  // restructure changes neither count -- which seeks happen is the behaviour, the milliseconds are
+  // only the machine.
+  [[nodiscard]] int getSeekCount() const noexcept { return cur_.seeks; }
+  [[nodiscard]] int getDecodedFrameCount() const noexcept { return cur_.frames_decoded; }
+
   /// Extracts the frame for `requested` (asset-relative). Thread-unsafe by design.
   [[nodiscard]] std::expected<Image, Error> image_at(Time requested, const CancelToken& token) {
     return image_at(requested, RequestOptions{}, token);
