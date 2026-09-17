@@ -66,14 +66,24 @@ enum class WaitResult : std::uint8_t {
 
 namespace detail {
 struct Batch;
+struct Engine;
 }
 
 /// Delivered to the completion handler exactly once per requested time.
 struct Completion {
+  /// Constructs the item for one requested time. The batch it belongs to is attached by the
+  /// engine that delivers it; there is no way to construct a completion already bound to one.
+  Completion(std::size_t idx, Time at, std::expected<Image, Error> outcome)
+      : index(idx), requested_time(at), result(std::move(outcome)) {}
+
+  /// Move-only, like the Image it carries: a Completion may be moved out of the handler.
+  Completion(Completion&&) noexcept = default;
+  Completion& operator=(Completion&&) noexcept = default;
+
   /// Position of this item in the `times` passed to generate_images().
-  std::size_t index = 0;
-  Time requested_time = {};
-  std::expected<Image, Error> result = std::unexpected(Error{ErrorCode::internal});
+  std::size_t index;
+  Time requested_time;
+  std::expected<Image, Error> result;
 
   [[nodiscard]] GenerationStatus status() const noexcept {
     if (result) return GenerationStatus::succeeded;
@@ -86,11 +96,13 @@ struct Completion {
   /// has returned the handle. Idempotent, never blocks, never runs user code.
   void cancel_batch() const noexcept;
 
-  /// Internal: the batch this completion is being delivered from. Set by the worker, read only by
-  /// cancel_batch(). Weak, not raw: a Completion may be moved out of the handler to keep its Image,
-  /// and then outlives the batch. Never set it yourself — the reserved name says so and nothing
-  /// else reads it.
-  std::weak_ptr<detail::Batch> reserved_batch_ = {};
+ private:
+  friend struct detail::Engine;
+
+  // The batch this completion is being delivered from. Set by the engine, read only by
+  // cancel_batch(). Weak, not raw: a Completion may be moved out of the handler to keep its Image,
+  // and then outlives the batch.
+  std::weak_ptr<detail::Batch> batch;
 };
 
 /// Move-only callable receiving Completions. May capture move-only state.
@@ -120,7 +132,7 @@ struct Batch {
 }  // namespace detail
 
 inline void Completion::cancel_batch() const noexcept {
-  if (const std::shared_ptr<detail::Batch> b = reserved_batch_.lock()) b->cancelled.store(true);
+  if (const std::shared_ptr<detail::Batch> b = batch.lock()) b->cancelled.store(true);
 }
 
 /// Observer handle for one generate_images() call. Copyable, and copies share cancellation: they

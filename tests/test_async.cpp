@@ -442,7 +442,8 @@ TEST_CASE("async: a handler cancels its own batch with Completion::cancel_batch"
 
 // A Completion owns its Image, so moving it out of the handler is the only way to keep the frame —
 // and a Completion kept that way outlives the batch it came from. cancel_batch() on it must then be
-// a no-op, not a write through a dangling pointer (it was one, until reserved_batch_ became weak).
+// a no-op, not a write through a dangling pointer (it was one, until the batch reference
+// became weak).
 TEST_CASE("async: cancel_batch on a Completion outliving its batch is a no-op",
           "[async][cancel][lifetime]") {
   std::optional<Completion> saved;

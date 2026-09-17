@@ -209,7 +209,7 @@ struct Engine {
       // only this thread can clear.
       release_turn(claimed_turn);
       Completion done{index, t, std::move(result)};
-      done.reserved_batch_ = batch;  // so the handler can cancel the rest of its own batch
+      done.batch = batch;  // so the handler can cancel the rest of its own batch
       batch->handler(std::move(done));
       const bool last = index + 1 == batch->times.size();
       if (last)
