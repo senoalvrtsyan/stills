@@ -32,8 +32,8 @@ namespace stills
 namespace detail
 {
 
-/// Everything a generator owns. Heap-allocated and never moved: the worker thread and libav
-/// callbacks hold pointers into it.
+// Everything a generator owns. Heap-allocated and never moved: the worker thread and libav
+// callbacks hold pointers into it.
 struct Engine
 {
     Options options;
@@ -49,21 +49,21 @@ struct Engine
     bool workerDone{ false }; // the worker has drained and left run(); nothing can be delivered any more
     std::atomic<bool> stopFlag{ false };
 
-    /// How long the worker defers to waiting synchronous callers before claiming a turn of its own.
-    /// Bounds the sync-first policy: continuous imageAt() traffic slows a batch to roughly one item
-    /// per limit, but cannot stop it.
+    // How long the worker defers to waiting synchronous callers before claiming a turn of its own.
+    // Bounds the sync-first policy: continuous imageAt() traffic slows a batch to roughly one item
+    // per limit, but cannot stop it.
     static constexpr std::chrono::milliseconds syncPriorityLimit{ 20 };
 
-    /// Set by the worker once it has deferred for syncPriorityLimit with an item to dispatch, and
-    /// cleared as soon as that item's decode has released the decoder — before its handler runs, so a
-    /// handler calling imageAt() on this same thread is not waiting on itself. While it is set,
-    /// synchronous callers that have not yet taken the decoder wait here instead. Guarded by
-    /// queueMutex.
+    // Set by the worker once it has deferred for syncPriorityLimit with an item to dispatch, and
+    // cleared as soon as that item's decode has released the decoder — before its handler runs, so a
+    // handler calling imageAt() on this same thread is not waiting on itself. While it is set,
+    // synchronous callers that have not yet taken the decoder wait here instead. Guarded by
+    // queueMutex.
     bool workerTurn{ false };
     std::condition_variable turnCv;
 
-    /// Two-phase start: the worker's body waits here until the creator has stored `worker`, so
-    /// nothing the body reads — including AsyncRequest's worker-id check — is still being written.
+    // Two-phase start: the worker's body waits here until the creator has stored `worker`, so
+    // nothing the body reads — including AsyncRequest's worker-id check — is still being written.
     std::latch startGate{ 1 };
     std::thread worker; // last member: constructed after everything it touches
 
@@ -72,11 +72,11 @@ struct Engine
     Engine& operator= (const Engine&) = delete;
     ~Engine() = default; // never joins here: may run on the worker thread itself
 
-    /// Publishes a batch. A batch queued while teardown is under way is queued all the same: the
-    /// worker's drain delivers everything queued as `cancelled`, which is what a completion
-    /// handler chaining another request during destruction must be able to observe. Only once the
-    /// worker has drained and exited is there nobody left to deliver: the batch is then marked
-    /// finished without invoking its handler and this returns false.
+    // Publishes a batch. A batch queued while teardown is under way is queued all the same: the
+    // worker's drain delivers everything queued as `cancelled`, which is what a completion
+    // handler chaining another request during destruction must be able to observe. Only once the
+    // worker has drained and exited is there nobody left to deliver: the batch is then marked
+    // finished without invoking its handler and this returns false.
     bool enqueue (std::shared_ptr<Batch> b)
     {
         // Recorded before publication so a handler of an *earlier* batch that waits on this one is
@@ -129,8 +129,8 @@ struct Engine
         turnCv.notify_all();
     }
 
-    /// Clears a turn claimed by run() and wakes the synchronous callers parked behind it. Takes the
-    /// flag by reference so a released turn cannot be released twice.
+    // Clears a turn claimed by run() and wakes the synchronous callers parked behind it. Takes the
+    // flag by reference so a released turn cannot be released twice.
     void releaseTurn (bool& claimed) noexcept
     {
         if (! claimed) return;
@@ -143,18 +143,18 @@ struct Engine
         turnCv.notify_all();
     }
 
-    /// Worker loop. noexcept: an exception escaping a user handler terminates the process, which is
-    /// the documented contract (swallowing it would silently break exactly-once accounting).
-    ///
-    /// Scheduling: one item of the front batch per turn, with a waiting synchronous imageAt() given
-    /// the decoder first. A batch stays at the front until its last item has been dispatched, so
-    /// items of one batch are delivered in request order and the queue is FIFO by batch.
-    ///
-    /// The priority is bounded (syncPriorityLimit): synchronous callers arriving back to back keep
-    /// going first, but once the worker has deferred for that long it takes one item anyway. Without
-    /// the bound a few threads calling imageAt() in a loop never leave syncWaiters at zero, and
-    /// because std::mutex grants no fairness they also keep winning the decoder back, so the queue
-    /// makes almost no progress at all.
+    // Worker loop. noexcept: an exception escaping a user handler terminates the process, which is
+    // the documented contract (swallowing it would silently break exactly-once accounting).
+    //
+    // Scheduling: one item of the front batch per turn, with a waiting synchronous imageAt() given
+    // the decoder first. A batch stays at the front until its last item has been dispatched, so
+    // items of one batch are delivered in request order and the queue is FIFO by batch.
+    //
+    // The priority is bounded (syncPriorityLimit): synchronous callers arriving back to back keep
+    // going first, but once the worker has deferred for that long it takes one item anyway. Without
+    // the bound a few threads calling imageAt() in a loop never leave syncWaiters at zero, and
+    // because std::mutex grants no fairness they also keep winning the decoder back, so the queue
+    // makes almost no progress at all.
     void run() noexcept
     {
         startGate.wait(); // `worker` is fully published

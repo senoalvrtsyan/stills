@@ -104,6 +104,13 @@ struct DecodeFrontier
     // The decoder was drained for a keyframe-only decode and must be flushed (seek) before more
     // input. Distinct from `draining`, which is the drain in progress.
     bool drained = false;
+    // Nearest-keyframe mode: the keyframe packet that was fed *is* the answer, established at the
+    // packet level by the landing scan and not from the frame that comes out. Without it the first
+    // keyframe out of the decoder only answers the request when the seek aimed at the request
+    // itself. Set where the keyframe is fed and drained (FramePipeline::armKeyframeDecode) and read
+    // by the selection loop, so it lives beside `draining`/`drained` rather than with the landing:
+    // it is a fact about this decode pass, not about where the demuxer was put.
+    bool landingKnown = false;
     bool tainted = false; // a decode error occurred since the last keyframe
     SkippedFrames skipped;
 
@@ -117,7 +124,7 @@ struct DecodeFrontier
         lastEnd = std::numeric_limits<std::int64_t>::min();
         synthTs = k::noPts;
         receivedSinceSeek = 0;
-        eof = draining = drained = false;
+        eof = draining = drained = landingKnown = false;
         tainted = false;
         skipped.clear();
     }

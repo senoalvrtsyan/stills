@@ -22,7 +22,7 @@
 namespace stills::detail
 {
 
-/// Display size of a coded frame: sample-aspect-ratio corrected (when enabled) and rotated.
+// Display size of a coded frame: sample-aspect-ratio corrected (when enabled) and rotated.
 [[nodiscard]] inline Size displaySize (Size coded, AVRational sar, bool applySar, int rotation) noexcept
 {
     Size d = coded;
@@ -37,9 +37,9 @@ namespace stills::detail
     return d;
 }
 
-/// Fits `display` into `max` (either dimension 0/absent = unconstrained) preserving aspect ratio,
-/// never upscaling, and rounding down to even for chroma-subsampled formats (minimum 2x2; boxes
-/// smaller than that are rejected by Options::validate).
+// Fits `display` into `max` (either dimension 0/absent = unconstrained) preserving aspect ratio,
+// never upscaling, and rounding down to even for chroma-subsampled formats (minimum 2x2; boxes
+// smaller than that are rejected by Options::validate).
 [[nodiscard]] inline Size fitSize (Size display, std::optional<Size> max, PixelFormat fmt) noexcept
 {
     double scale = 1.0;
@@ -62,8 +62,8 @@ namespace stills::detail
     return out;
 }
 
-/// Resolves the sample aspect ratio the way av_guess_sample_aspect_ratio (and ffmpeg/ffplay) do:
-/// the container's declaration wins, then the frame's, then the codec's; 1:1 when nothing is set.
+// Resolves the sample aspect ratio the way av_guess_sample_aspect_ratio (and ffmpeg/ffplay) do:
+// the container's declaration wins, then the frame's, then the codec's; 1:1 when nothing is set.
 [[nodiscard]] inline AVRational resolveSar (AVRational container, AVRational frame, AVRational codec) noexcept
 {
     const auto ok = [] (AVRational r) { return r.num > 0 && r.den > 0; };
@@ -76,13 +76,13 @@ namespace stills::detail
 
 [[nodiscard]] inline std::expected<FramePtr, Error> transferToSoftwareUnpooled (const AVFrame& hw);
 
-/// Converts decoded software frames to the configured output format/size.
+// Converts decoded software frames to the configured output format/size.
 class Converter
 {
 public:
-    /// `stripDisplayMatrix`: the display transform has been applied, so the output frame must not
-    /// carry the AV_FRAME_DATA_DISPLAYMATRIX side data any more (an interop consumer honouring it
-    /// would rotate a second time).
+    // `stripDisplayMatrix`: the display transform has been applied, so the output frame must not
+    // carry the AV_FRAME_DATA_DISPLAYMATRIX side data any more (an interop consumer honouring it
+    // would rotate a second time).
     Converter (PixelFormat fmt, Scaler scaler, std::optional<Size> max, bool applySar, int rotation, bool mirror,
                bool stripDisplayMatrix) noexcept
       : fmt (fmt),
@@ -98,15 +98,15 @@ public:
     [[nodiscard]] int getRotation() const noexcept { return rotation; }
     [[nodiscard]] bool isMirrored() const noexcept { return mirror; }
 
-    /// Final (rotated) output size for a source of this coded size and SAR.
+    // Final (rotated) output size for a source of this coded size and SAR.
     [[nodiscard]] Size outputSize (Size coded, AVRational sar) const noexcept
     {
         return fitSize (displaySize (coded, sar, applySar, rotation), maxSize, fmt);
     }
 
-    /// Downloads a hardware frame into a pooled software frame (props copied). Pooling matters: a
-    /// fresh allocation per transfer is large enough for glibc to mmap it, so every transfer pays for
-    /// page faults on top of the DMA.
+    // Downloads a hardware frame into a pooled software frame (props copied). Pooling matters: a
+    // fresh allocation per transfer is large enough for glibc to mmap it, so every transfer pays for
+    // page faults on top of the DMA.
     [[nodiscard]] std::expected<FramePtr, Error> download (const AVFrame& hw)
     {
         AVPixelFormat swFmt = AV_PIX_FMT_NONE;
@@ -118,8 +118,8 @@ public:
         auto sw = pooledFrame (swFmt, hw.width, hw.height, "download");
 
         if (! sw) return std::unexpected (sw.error());
-        // Through the hook (detail/stills_DecoderHooks.h) so the rebuild-once path a driver fault drives can be
-        // tested on the shipped code. Defaults to av_hwframe_transfer_data itself.
+        // Through the hook (detail/stills_DecoderHooks.h) so the rebuild-once path a driver fault
+        // drives can be tested on the shipped code. Defaults to av_hwframe_transfer_data itself.
         if (int r = decoderHooks().hwframeTransferData (sw->get(), &hw, 0); r < 0)
         {
             return fail (ErrorCode::conversionFailed, r, "av_hwframe_transfer_data");
@@ -133,16 +133,16 @@ public:
         return std::move (*sw);
     }
 
-    /// Final (rotated) output size with a per-request box override (RequestOptions::maximumSize).
+    // Final (rotated) output size with a per-request box override (RequestOptions::maximumSize).
     [[nodiscard]] Size outputSize (Size coded, AVRational sar, std::optional<Size> maxOverride) const noexcept
     {
         return fitSize (displaySize (coded, sar, applySar, rotation), maxOverride ? maxOverride : maxSize, fmt);
     }
 
-    /// Scales/converts `src` (a software frame) and applies the display transform. The SAR is
-    /// resolved from the container's, the frame's and the codec's declarations in that order.
-    /// Output and intermediate frames come from per-size buffer pools, so a steady stream of requests
-    /// recycles a few buffers instead of allocating a full frame per image.
+    // Scales/converts `src` (a software frame) and applies the display transform. The SAR is
+    // resolved from the container's, the frame's and the codec's declarations in that order.
+    // Output and intermediate frames come from per-size buffer pools, so a steady stream of requests
+    // recycles a few buffers instead of allocating a full frame per image.
     [[nodiscard]] std::expected<FramePtr, Error> convert (const AVFrame& src, AVRational containerSar,
                                                           AVRational codecSar,
                                                           std::optional<Size> maxOverride = std::nullopt)
@@ -221,13 +221,13 @@ public:
     }
 
 private:
-    /// NV12/NV21 sources headed for a packed RGB or gray output take the two-step route.
+    // NV12/NV21 sources headed for a packed RGB or gray output take the two-step route.
     [[nodiscard]] bool needsReplaning (AVPixelFormat f) const noexcept
     {
         return (f == AV_PIX_FMT_NV12 || f == AV_PIX_FMT_NV21) && (isPackedRgb (fmt) || fmt == PixelFormat::gray8);
     }
 
-    /// NV12/NV21 -> YUV420P at the same size: a plane rearrangement (colour metadata preserved).
+    // NV12/NV21 -> YUV420P at the same size: a plane rearrangement (colour metadata preserved).
     [[nodiscard]] std::expected<FramePtr, Error> replane (const AVFrame& src)
     {
         auto out = pooledFrame (AV_PIX_FMT_YUV420P, src.width, src.height, "replane");
@@ -252,8 +252,8 @@ private:
         return std::move (*out);
     }
 
-    /// A scaling context for this geometry from a small most-recently-used set, so that alternating
-    /// output sizes (a native-size still and a 160 px thumbnail) do not re-create one per request.
+    // A scaling context for this geometry from a small most-recently-used set, so that alternating
+    // output sizes (a native-size still and a 160 px thumbnail) do not re-create one per request.
     [[nodiscard]] SwsContext* scalerFor (int sw, int sh, AVPixelFormat sfmt, int dw, int dh)
     {
         ++clock;
@@ -286,9 +286,9 @@ private:
         return s.ctx.get();
     }
 
-    /// A frame whose pixel buffer comes from a pool keyed on (format, width, height): the layout is
-    /// the one av_frame_get_buffer() produces (64-byte aligned lines, 32-row padded height) so rows
-    /// may be padded exactly as before. Buffers return to the pool when the Image is destroyed.
+    // A frame whose pixel buffer comes from a pool keyed on (format, width, height): the layout is
+    // the one av_frame_get_buffer() produces (64-byte aligned lines, 32-row padded height) so rows
+    // may be padded exactly as before. Buffers return to the pool when the Image is destroyed.
     [[nodiscard]] std::expected<FramePtr, Error> pooledFrame (AVPixelFormat fmt, int width, int height,
                                                               const char* what)
     {
@@ -373,9 +373,9 @@ private:
         return std::move (*frame);
     }
 
-    /// Tells swscale the source matrix/range so 709 content is not decoded with 601 coefficients
-    /// and limited-range luma is expanded for RGB outputs; labels the output with what swscale was
-    /// told to produce.
+    // Tells swscale the source matrix/range so 709 content is not decoded with 601 coefficients
+    // and limited-range luma is expanded for RGB outputs; labels the output with what swscale was
+    // told to produce.
     void applyColorspace (const AVFrame& src, AVFrame* dst, SwsContext* sws) noexcept
     {
         const auto* desc = av_pix_fmt_desc_get (static_cast<AVPixelFormat> (src.format));
@@ -435,7 +435,7 @@ private:
     SwsCtxPtr swsReplane;
 };
 
-/// Downloads a hardware frame into a new software frame (props copied), allocating the destination.
+// Downloads a hardware frame into a new software frame (props copied), allocating the destination.
 [[nodiscard]] inline std::expected<FramePtr, Error> transferToSoftwareUnpooled (const AVFrame& hw)
 {
     auto sw = makeFrame();

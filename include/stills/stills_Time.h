@@ -40,8 +40,8 @@ namespace detail
 
 __extension__ using int128 = __int128;
 
-/// Computes a * num / den with the requested rounding. Requires den > 0.
-/// Returns nullopt when the result does not fit in int64_t.
+// Computes a * num / den with the requested rounding. Requires den > 0.
+// Returns nullopt when the result does not fit in int64_t.
 [[nodiscard]] constexpr std::optional<std::int64_t> rescale (std::int64_t a, std::int64_t num, std::int64_t den,
                                                              TimeRounding rounding) noexcept
 {
@@ -82,7 +82,7 @@ __extension__ using int128 = __int128;
     return static_cast<std::int64_t> (q);
 }
 
-/// Compares a/b with c/d (b, d > 0) without overflow. Returns <0, 0, >0.
+// Compares a/b with c/d (b, d > 0) without overflow. Returns <0, 0, >0.
 [[nodiscard]] constexpr int compareRatios (std::int64_t a, std::int64_t b, std::int64_t c, std::int64_t d) noexcept
 {
     const int128 lhs = static_cast<int128> (a) * static_cast<int128> (d);
@@ -478,7 +478,7 @@ public:
     }
 
 private:
-    /// `count` whole seconds times `per` seconds each, as a Time, or invalid on overflow.
+    // `count` whole seconds times `per` seconds each, as a Time, or invalid on overflow.
     static constexpr Time wholeSeconds (std::int64_t count, std::int64_t per) noexcept
     {
         std::int64_t seconds = 0;
@@ -513,7 +513,7 @@ private:
         return 0;
     }
 
-    /// lcm when it fits in int32, otherwise the larger of the two (rounding may then occur).
+    // lcm when it fits in int32, otherwise the larger of the two (rounding may then occur).
     static constexpr std::int32_t commonTimescale (std::int32_t a, std::int32_t b) noexcept
     {
         if (a == b) return a;

@@ -219,8 +219,8 @@ public:
 private:
     explicit AssetImageGenerator (std::shared_ptr<detail::Engine> e) noexcept : engine (std::move (e)) {}
 
-    /// A source string reaches libavformat as a C string, so an embedded NUL would silently open the
-    /// prefix — a std::string_view built from a fixed buffer is the usual way that happens.
+    // A source string reaches libavformat as a C string, so an embedded NUL would silently open the
+    // prefix — a std::string_view built from a fixed buffer is the usual way that happens.
     [[nodiscard]] static std::expected<void, Error> checkSource (std::string_view source)
     {
         if (source.empty()) return detail::fail (ErrorCode::invalidArgument, "source is empty");

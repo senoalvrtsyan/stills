@@ -13,21 +13,21 @@
 namespace stills::detail
 {
 
-/// The libav entry points the decode path calls through. Defaults are the libav functions
-/// themselves, so a shipped build behaves exactly as if it called them directly.
+// The libav entry points the decode path calls through. Defaults are the libav functions
+// themselves, so a shipped build behaves exactly as if it called them directly.
 struct DecoderHooks
 {
     int (*hwframeTransferData) (AVFrame* dst, const AVFrame* src, int flags) = &av_hwframe_transfer_data;
 };
 
-/// The process's hooks. One object; see the contract above.
+// The process's hooks. One object; see the contract above.
 [[nodiscard]] inline DecoderHooks& decoderHooks() noexcept
 {
     static DecoderHooks hooks;
     return hooks;
 }
 
-/// Installs a hook for a scope and restores the previous one. Tests only.
+// Installs a hook for a scope and restores the previous one. Tests only.
 class ScopedHook
 {
 public:

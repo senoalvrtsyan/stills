@@ -95,8 +95,8 @@ inline constexpr AVRational timeBaseQ{ 1, AV_TIME_BASE };
 
 static_assert (k::noPts == std::numeric_limits<std::int64_t>::min());
 
-/// Deleter for libav allocations. Handles both `void f(T**)` (avformat_close_input,
-/// avcodec_free_context, av_frame_free, ...) and `void f(T*)` (sws_freeContext) shapes.
+// Deleter for libav allocations. Handles both `void f(T**)` (avformat_close_input,
+// avcodec_free_context, av_frame_free, ...) and `void f(T*)` (sws_freeContext) shapes.
 template <auto Fn>
 struct AvDeleter
 {
@@ -133,7 +133,7 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     return std::string{ buf };
 }
 
-/// Builds an Error from a libav return value with context ("avformat_open_input(\"x.mp4\")").
+// Builds an Error from a libav return value with context ("avformat_open_input(\"x.mp4\")").
 [[nodiscard]] inline Error makeError (ErrorCode code, int avErr, std::string context)
 {
     if (avErr < 0)
@@ -160,7 +160,7 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     return std::unexpected (makeError (code, std::move (message)));
 }
 
-/// Maps a generic libav return code to the closest ErrorCode when no better context exists.
+// Maps a generic libav return code to the closest ErrorCode when no better context exists.
 [[nodiscard]] inline ErrorCode classify (int avErr, ErrorCode fallback) noexcept
 {
     if (avErr == k::enomem) return ErrorCode::outOfMemory;
@@ -263,7 +263,7 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     }
 }
 
-/// Resolves our device enum to libav's at runtime by name; NONE if this build lacks the type.
+// Resolves our device enum to libav's at runtime by name; NONE if this build lacks the type.
 [[nodiscard]] inline AVHWDeviceType toAv (HardwareDeviceType t) noexcept
 {
     return av_hwdevice_find_type_by_name (std::string{ toString (t) }.c_str());
@@ -309,7 +309,7 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     return SWS_BICUBIC;
 }
 
-/// Allocation helpers returning expected so callers never see a null libav pointer.
+// Allocation helpers returning expected so callers never see a null libav pointer.
 [[nodiscard]] inline std::expected<FramePtr, Error> makeFrame()
 {
     FramePtr f{ av_frame_alloc() };

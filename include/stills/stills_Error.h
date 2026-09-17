@@ -131,8 +131,8 @@ inline std::ostream& operator<< (std::ostream& os, const Error& e)
 
 namespace detail
 {
-/// The category behind stills::getErrorCategory(). One object per process: the address is the
-/// identity std::error_code compares by, and every namespace-scope entity here is inline.
+// The category behind stills::getErrorCategory(). One object per process: the address is the
+// identity std::error_code compares by, and every namespace-scope entity here is inline.
 class ErrorCategory : public std::error_category
 {
 public:

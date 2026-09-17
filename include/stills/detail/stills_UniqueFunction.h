@@ -52,7 +52,7 @@ public:
     UniqueFunction& operator= (const UniqueFunction&) = delete;
     ~UniqueFunction() = default;
 
-    /// Precondition: not empty. Calling an empty one is UB; the assert names it in debug builds.
+    // Precondition: not empty. Calling an empty one is UB; the assert names it in debug builds.
     R operator() (Args... args)
     {
         assert (impl != nullptr && "called an empty UniqueFunction");

@@ -1,5 +1,6 @@
 #pragma once
-// stills/detail/stills_HardwareSupport.h — hardware decoder candidate enumeration and the get_format negotiation.
+// stills/detail/stills_HardwareSupport.h — hardware decoder candidate enumeration and the
+// get_format negotiation.
 
 #include <algorithm>
 #include <array>
@@ -18,24 +19,24 @@
 namespace stills::detail
 {
 
-/// Shared with libavcodec through AVCodecContext::opaque. Heap-allocated by the pipeline so its
-/// address is stable for the codec context's lifetime.
+// Shared with libavcodec through AVCodecContext::opaque. Heap-allocated by the pipeline so its
+// address is stable for the codec context's lifetime.
 struct HwState
 {
     AVPixelFormat hw_pix_fmt{ AV_PIX_FMT_NONE };
-    bool gotHwFormat{ false }; ///< the decoder accepted our hardware format at least once
-    bool declined{ false };    ///< the decoder offered no hardware format (profile unsupported)
-    /// The surface pool, allocated once and handed to the decoder again after every flush (the
-    /// h264/hevc decoders renegotiate the format after avcodec_flush_buffers and libavcodec drops
-    /// the previous pool). Re-created when the coded size or software format changes mid-stream.
+    bool gotHwFormat{ false }; // the decoder accepted our hardware format at least once
+    bool declined{ false };    // the decoder offered no hardware format (profile unsupported)
+    // The surface pool, allocated once and handed to the decoder again after every flush (the
+    // h264/hevc decoders renegotiate the format after avcodec_flush_buffers and libavcodec drops
+    // the previous pool). Re-created when the coded size or software format changes mid-stream.
     BufferRefPtr framesCtx;
     int framesWidth{ 0 }, framesHeight{ 0 };
     AVPixelFormat framesSwFmt{ AV_PIX_FMT_NONE };
-    int extraFrames{ 0 }; ///< surfaces beyond the decoder's own needs (the pipeline's held frames)
+    int extraFrames{ 0 }; // surfaces beyond the decoder's own needs (the pipeline's held frames)
 };
 
-/// Supplies the persistent pool to the decoder (allocating it on first use or after a geometry
-/// change). Failure is not fatal: libavcodec allocates its own pool per negotiation as before.
+// Supplies the persistent pool to the decoder (allocating it on first use or after a geometry
+// change). Failure is not fatal: libavcodec allocates its own pool per negotiation as before.
 inline void hwSupplyFramesCtx (AVCodecContext* cc, HwState& st) noexcept
 {
     if (cc->hw_device_ctx == nullptr) return;
@@ -70,8 +71,8 @@ inline void hwSupplyFramesCtx (AVCodecContext* cc, HwState& st) noexcept
     if (cc->hw_frames_ctx == nullptr) cc->hw_frames_ctx = av_buffer_ref (st.framesCtx.get());
 }
 
-/// AVCodecContext::get_format callback: pick the negotiated hardware format if offered, else the
-/// first software format (and remember that hardware was declined).
+// AVCodecContext::get_format callback: pick the negotiated hardware format if offered, else the
+// first software format (and remember that hardware was declined).
 inline AVPixelFormat hwGetFormat (AVCodecContext* cc, const AVPixelFormat* fmts) noexcept
 {
     auto* st = static_cast<HwState*> (cc->opaque);
@@ -103,13 +104,13 @@ struct HwCandidate
     AVPixelFormat pix_fmt{ AV_PIX_FMT_NONE };
 };
 
-/// Static preference order (first match wins), by device family. Anything not listed (or not known
-/// to this FFmpeg build) keeps libav's order after the listed ones.
-/// CUDA/NVDEC is deliberately late: the h264 decoder renegotiates the hardware format after every
-/// avcodec_flush_buffers() — one get_format call per seek — and NVDEC re-creates its decoder each
-/// time, which dominates a seek. HEVC on NVDEC does not renegotiate. Seeking is this library's core
-/// operation, so the order reflects that; callers who want NVDEC anyway select it with
-/// Options::hardware.deviceType. The order was chosen from measurement on one machine.
+// Static preference order (first match wins), by device family. Anything not listed (or not known
+// to this FFmpeg build) keeps libav's order after the listed ones.
+// CUDA/NVDEC is deliberately late: the h264 decoder renegotiates the hardware format after every
+// avcodec_flush_buffers() — one get_format call per seek — and NVDEC re-creates its decoder each
+// time, which dominates a seek. HEVC on NVDEC does not renegotiate. Seeking is this library's core
+// operation, so the order reflects that; callers who want NVDEC anyway select it with
+// Options::hardware.deviceType. The order was chosen from measurement on one machine.
 inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
     HardwareDeviceType::videotoolbox, HardwareDeviceType::vaapi,     HardwareDeviceType::d3d11va,
     HardwareDeviceType::dxva2,        HardwareDeviceType::qsv,       HardwareDeviceType::vdpau,
@@ -130,8 +131,8 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
     return static_cast<int> (hwPreference.size());
 }
 
-/// Hardware device types this decoder can use through a device context, filtered by Options and
-/// ordered by preference. `reason` explains an empty result.
+// Hardware device types this decoder can use through a device context, filtered by Options and
+// ordered by preference. `reason` explains an empty result.
 [[nodiscard]] inline std::vector<HwCandidate> hwCandidates (const AVCodec* codec, const Options& opt,
                                                             std::string& reason)
 {
@@ -184,7 +185,7 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
     return out;
 }
 
-/// Device types that can actually be created on this machine (default device string).
+// Device types that can actually be created on this machine (default device string).
 [[nodiscard]] inline std::vector<HardwareDeviceType> probeAvailableHwTypes()
 {
     std::vector<HardwareDeviceType> out;

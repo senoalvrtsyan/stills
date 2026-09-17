@@ -239,7 +239,7 @@ private:
 
 namespace detail
 {
-/// Internal constructor/accessor gateway (also used by <stills/stills_Interop.h>).
+// Internal constructor/accessor gateway (also used by <stills/stills_Interop.h>).
 struct ImageAccess
 {
     [[nodiscard]] static Image make (FramePtr frame, PixelFormat format, ColorRange range, Time actualTime,

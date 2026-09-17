@@ -17,8 +17,8 @@
 // branch on.
 //
 // Not thread-safe, and not meant to be: a FramePipeline is single-threaded by contract
-// (stills_FramePipeline.h), and a slot is only ever touched by the thread running that pipeline's decode
-// loop.
+// (stills_FramePipeline.h), and a slot is only ever touched by the thread running that
+// pipeline's decode loop.
 
 #include <cassert>
 #include <utility>
@@ -36,8 +36,7 @@ public:
     // the same two values disagreeing, in the one direction the accessors cannot report, since
     // isValid() would say yes and getFrame() would hand back nullptr. Nothing moves a slot
     // (FramePipeline owns all three and is itself non-movable), so deleting it costs nothing and
-    // closes the hole by
-    // construction, which is the whole argument for this type.
+    // closes the hole by construction, which is the whole argument for this type.
     FrameSlot (FrameSlot&&) = delete;
     FrameSlot& operator= (FrameSlot&&) = delete;
 

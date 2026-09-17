@@ -128,8 +128,8 @@ using CompletionHandler = detail::UniqueFunction<void (Completion)>;
 namespace detail
 {
 
-/// One generateImages() call: its times, its handler, and the accounting AsyncRequest observes.
-/// Referenced by shared_ptr from the handle, the engine's queue and the item in progress.
+// One generateImages() call: its times, its handler, and the accounting AsyncRequest observes.
+// Referenced by shared_ptr from the handle, the engine's queue and the item in progress.
 struct Batch
 {
     std::vector<Time> times;

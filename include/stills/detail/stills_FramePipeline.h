@@ -49,7 +49,7 @@ namespace stills::detail
 class FramePipeline
 {
 public:
-    /// A frame chosen for a request, owned by the pipeline (one of its FrameSlots).
+    // A frame chosen for a request, owned by the pipeline (one of its FrameSlots).
     struct Selected
     {
         AVFrame* frame{ nullptr };
@@ -61,9 +61,9 @@ public:
     FramePipeline& operator= (const FramePipeline&) = delete;
     FramePipeline (FramePipeline&&) = delete;
     FramePipeline& operator= (FramePipeline&&) = delete;
-    /// Opens the source. `token` (optional) makes the open cancellable: libavformat's interrupt
-    /// callback consults it during probing and the first decode, so a stalled network source fails
-    /// with `cancelled` / `openFailed` instead of blocking.
+    // Opens the source. `token` (optional) makes the open cancellable: libavformat's interrupt
+    // callback consults it during probing and the first decode, so a stalled network source fails
+    // with `cancelled` / `openFailed` instead of blocking.
     [[nodiscard]] static std::expected<std::unique_ptr<FramePipeline>, Error> open (std::string source, Options options,
                                                                                     const CancelToken* token = nullptr)
     {
@@ -87,9 +87,9 @@ public:
 
     [[nodiscard]] const AssetInfo& getInfo() const noexcept { return info; }
 
-    /// Snapshot of the active decode path. Returned by value: a lazy hardware failure may switch
-    /// the path to software after open(), and readers must never observe a torn value. The only
-    /// member function of this class another thread may call (see stills_VideoDecoder.h).
+    // Snapshot of the active decode path. Returned by value: a lazy hardware failure may switch
+    // the path to software after open(), and readers must never observe a torn value. The only
+    // member function of this class another thread may call (see stills_VideoDecoder.h).
     [[nodiscard]] ActiveDecoder getActiveDecoder() const { return decoder.getActiveDecoder(); }
     [[nodiscard]] const Options& options() const noexcept { return opt; }
 
@@ -114,15 +114,15 @@ public:
         return static_cast<int> (decoder.getReceiveCount() - cur.framesAtStart);
     }
 
-    /// Extracts the frame for `requested` (asset-relative). Thread-unsafe by design.
+    // Extracts the frame for `requested` (asset-relative). Thread-unsafe by design.
     [[nodiscard]] std::expected<Image, Error> imageAt (Time requested, const CancelToken& token)
     {
         return imageAt (requested, RequestOptions{}, token);
     }
 
-    /// The decode path allocates freely and the async worker's loop is noexcept, so a std::bad_alloc
-    /// below here would terminate instead of surfacing the outOfMemory the API defines. Caught at
-    /// this frame, the only one that can drop the half-updated state: the next request re-positions.
+    // The decode path allocates freely and the async worker's loop is noexcept, so a std::bad_alloc
+    // below here would terminate instead of surfacing the outOfMemory the API defines. Caught at
+    // this frame, the only one that can drop the half-updated state: the next request re-positions.
     [[nodiscard]] std::expected<Image, Error> imageAt (Time requested, const RequestOptions& ro,
                                                        const CancelToken& token)
     {
@@ -216,9 +216,9 @@ private:
         return result;
     }
 
-    /// Positions and selects the frame for `requested` without converting it (the frame stays owned
-    /// by the pipeline, in one of its FrameSlots). Validates the request, maps the time into stream
-    /// ticks, applies the bounds policy and the tolerance window.
+    // Positions and selects the frame for `requested` without converting it (the frame stays owned
+    // by the pipeline, in one of its FrameSlots). Validates the request, maps the time into stream
+    // ticks, applies the bounds policy and the tolerance window.
     [[nodiscard]] std::expected<Selected, Error> selectFor (Time requested, const RequestOptions& ro,
                                                             const CancelToken& token)
     {
@@ -352,9 +352,9 @@ public:
     ~FramePipeline() = default;
 
 private:
-    /// The pipeline's own half of opening: the decoder libavformat picked for the stream, the packet
-    /// and frame buffers, and the converter (whose orientation comes from the stream's display
-    /// matrix). Runs after every MediaSource open and re-open, and owns nothing MediaSource owns.
+    // The pipeline's own half of opening: the decoder libavformat picked for the stream, the packet
+    // and frame buffers, and the converter (whose orientation comes from the stream's display
+    // matrix). Runs after every MediaSource open and re-open, and owns nothing MediaSource owns.
     [[nodiscard]] std::expected<void, Error> attachToSource()
     {
         if (auto r = decoder.attach (source.getCodec()); ! r) return r;
@@ -375,10 +375,10 @@ private:
         return {};
     }
 
-    /// Builds (or replaces) the decoder for the stream, and puts the pipeline back to knowing
-    /// nothing: a frame decoded by the decoder being replaced says nothing about where its
-    /// replacement is. The drop happens before the build rather than inside it, so the surfaces a
-    /// hardware decoder handed us are given back before its pool is.
+    // Builds (or replaces) the decoder for the stream, and puts the pipeline back to knowing
+    // nothing: a frame decoded by the decoder being replaced says nothing about where its
+    // replacement is. The drop happens before the build rather than inside it, so the surfaces a
+    // hardware decoder handed us are given back before its pool is.
     [[nodiscard]] std::expected<void, Error> buildCodec (const HwCandidate* hw)
     {
         resetPosition(); // including the recorded holes: a new decoder produces them all again
@@ -402,8 +402,8 @@ private:
         return {};
     }
 
-    /// Tries the hardware candidates in preference order, then software. Each attempt is validated
-    /// by decoding the first frame so lazy failures surface here, not on the first request.
+    // Tries the hardware candidates in preference order, then software. Each attempt is validated
+    // by decoding the first frame so lazy failures surface here, not on the first request.
     [[nodiscard]] std::expected<void, Error> setupDecoder()
     {
         std::string reason;
@@ -469,7 +469,7 @@ private:
         return {};
     }
 
-    /// Re-creates the active hardware decoder (same device type and format) and re-probes it.
+    // Re-creates the active hardware decoder (same device type and format) and re-probes it.
     [[nodiscard]] std::expected<void, Error> rebuildHardware()
     {
         const std::optional<HwCandidate> c = decoder.getHardwareCandidate();
@@ -508,9 +508,9 @@ private:
         return {};
     }
 
-    /// Decodes the first frame of the stream (any tolerance) and remembers its timestamp. Always
-    /// goes through the explicit start seek, so on containers whose seek does not land on
-    /// keyframes (MPEG-TS) the "first frame" really is the first frame, for every candidate.
+    // Decodes the first frame of the stream (any tolerance) and remembers its timestamp. Always
+    // goes through the explicit start seek, so on containers whose seek does not land on
+    // keyframes (MPEG-TS) the "first frame" really is the first frame, for every candidate.
     [[nodiscard]] std::expected<void, Error> probeFirstFrame()
     {
         CancelToken none;
@@ -625,8 +625,9 @@ private:
         held.clear();
         pending.clear();
         corruptLast.clear();
-        frontier.reset(); // including the recorded holes: nothing before a reposition can matter
-        position.clearLanding();
+        // Including the recorded holes and the established landing: nothing concluded before a
+        // reposition can matter afterwards.
+        frontier.reset();
         decodeErrors = 0;
         probeFrame = nullptr;
         keys.resetContiguity();
@@ -636,12 +637,12 @@ private:
     void afterSeek (std::int64_t target, bool atStart) noexcept
     {
         decoder.flush();
-        resetPosition(); // clears the landing; nothing it drops is read between here and the mark
+        resetPosition(); // nothing it drops is read between here and the mark below
         position.markSeeked (target, atStart);
         frontier.synthTs = target; // after resetPosition(), which clears it
     }
 
-    /// Seeks towards `target`. Where the seek actually landed is established by readLanding().
+    // Seeks towards `target`. Where the seek actually landed is established by readLanding().
     [[nodiscard]] std::expected<void, Error> seekTo (std::int64_t target)
     {
         const int r = source.seekTo (target);
@@ -658,8 +659,8 @@ private:
         return {};
     }
 
-    /// Positions on a recorded keyframe packet by byte offset (containers without a trusted index).
-    /// The next packet read is that keyframe.
+    // Performs MediaSource::byteSeekTo() for a recorded keyframe and records the landing at that
+    // keyframe's presentation time.
     [[nodiscard]] std::expected<void, Error> byteSeek (const KeyEntry& e)
     {
         const int r = source.byteSeekTo (e.pos);
@@ -675,10 +676,10 @@ private:
         return {};
     }
 
-    /// Positions on the very first packet, unconditionally. A timestamp below the stream's first
-    /// DTS resolves to the first packet in libavformat's binary search (MPEG-TS/PS), to sample 0 in
-    /// mov and to the first cue in Matroska; index-based demuxers that reject an out-of-range
-    /// timestamp get a plain seek to startPts, and if that fails too the input is re-opened.
+    // Positions on the very first packet, unconditionally (how each demuxer resolves that is
+    // MediaSource::seekToStart()'s comment). Adds the policy: a source that cannot seek at all is
+    // re-opened instead, one that cannot even be re-opened fails with notSeekable, and a landing
+    // here is the one that sets landedAtStart.
     [[nodiscard]] std::expected<void, Error> seekToStart()
     {
         if (! getStreamInfo().seekable)
@@ -712,18 +713,18 @@ private:
         return {};
     }
 
-    /// Re-establishes the source from scratch (non-seekable sources that must rewind, or after a
-    /// failed seek) and rebuilds the decoder on top of it.
-    ///
-    /// MediaSource::reopen() re-opens the container and returns: the container and the decoder have
-    /// different lifetimes (this one container outlives two or three decoder rebuilds on the hardware
-    /// fallback path), so the order of the two is decided here rather than buried in the re-open.
-    /// buildCodec() is what resets the decode position, exactly as it does for every other rebuild.
-    ///
-    /// No re-open under an already-cancelled request: the re-probe runs its I/O through the interrupt
-    /// callback and would keep only what it managed to read. Checked here rather than inside
-    /// MediaSource, because by the time the container is touched this has already given up its
-    /// decoder, and a cancelled request must not pay that.
+    // Re-establishes the source from scratch (non-seekable sources that must rewind, or after a
+    // failed seek) and rebuilds the decoder on top of it.
+    //
+    // MediaSource::reopen() re-opens the container and returns: the container and the decoder have
+    // different lifetimes (this one container outlives two or three decoder rebuilds on the hardware
+    // fallback path), so the order of the two is decided here rather than buried in the re-open.
+    // buildCodec() is what resets the decode position, exactly as it does for every other rebuild.
+    //
+    // No re-open under an already-cancelled request: the re-probe runs its I/O through the interrupt
+    // callback and would keep only what it managed to read. Checked here rather than inside
+    // MediaSource, because by the time the container is touched this has already given up its
+    // decoder, and a cancelled request must not pay that.
     [[nodiscard]] std::expected<void, Error> reopen()
     {
         if (source.isCancelled())
@@ -755,13 +756,13 @@ private:
         return {};
     }
 
-    /// Throws away everything the decoder and this pipeline believed after an interrupt aborted a
-    /// libavformat read. MediaSource clears libavio's sticky state and flushes the demuxer; the
-    /// decoder flush, the frontier and the position are this pipeline's to drop.
-    ///
-    /// Returns false when the sticky state could not be cleared in place (see
-    /// MediaSource::recoverAfterInterrupt) and the source can be re-opened. The caller must then
-    /// re-establish it before the next read; nothing else clears the I/O layer.
+    // Throws away everything the decoder and this pipeline believed after an interrupt aborted a
+    // libavformat read. MediaSource clears libavio's sticky state and flushes the demuxer; the
+    // decoder flush, the frontier and the position are this pipeline's to drop.
+    //
+    // Returns false when the sticky state could not be cleared in place (see
+    // MediaSource::recoverAfterInterrupt) and the source can be re-opened. The caller must then
+    // re-establish it before the next read; nothing else clears the I/O layer.
     [[nodiscard]] bool recoverAfterInterrupt() noexcept
     {
         const MediaSource::IoState io = source.recoverAfterInterrupt();
@@ -793,9 +794,9 @@ private:
         return true;
     }
 
-    /// Re-positions for `P` after an end of stream that produced no frames at all. libavio's sticky
-    /// end-of-file is cleared first: a seek leaves it set, so the retry would read EOF again. On a
-    /// libavformat major where it cannot be cleared in place, the source is re-opened instead.
+    // Re-positions for `P` after an end of stream that produced no frames at all. libavio's sticky
+    // end-of-file is cleared first: a seek leaves it set, so the retry would read EOF again. On a
+    // libavformat major where it cannot be cleared in place, the source is re-opened instead.
     [[nodiscard]] std::expected<void, Error> retryAfterEmptyEof (std::int64_t P, const CancelToken& token)
     {
         if (! source.tryResetIo() && getStreamInfo().ioSeekable)
@@ -815,8 +816,8 @@ private:
         return positionFor (P, keyframeOnly, token);
     }
 
-    /// Seeks towards `target`, with the failure policy: interrupted I/O is reported as is, other
-    /// failures count towards giving up on seeking and fall back to a re-open.
+    // Seeks towards `target`, with the failure policy: interrupted I/O is reported as is, other
+    // failures count towards giving up on seeking and fall back to a re-open.
     [[nodiscard]] std::expected<void, Error> seekOrReopen (std::int64_t target)
     {
         if (target <= getStreamInfo().startPts) return seekToStart();
@@ -845,16 +846,16 @@ private:
         return Positioner::framesTicks (getStreamInfo(), n);
     }
 
-    /// What a positioning decision reads, gathered fresh at every call: a re-open replaces the
-    /// AVStream the container view names, so a view must never outlive the decision it is handed to.
+    // What a positioning decision reads, gathered fresh at every call: a re-open replaces the
+    // AVStream the container view names, so a view must never outlive the decision it is handed to.
     [[nodiscard]] PositioningView positioningView() const noexcept
     {
         return PositioningView{ getStreamInfo(), keys, frontier, costs, position, containerIndexOf (source) };
     }
 
-    /// Decides between continuing to decode forward and seeking, then positions accordingly. In
-    /// keyframe mode the answer is a keyframe packet that is then decoded alone
-    /// (armKeyframeDecode).
+    // Decides between continuing to decode forward and seeking, then positions accordingly. In
+    // keyframe mode the answer is a keyframe packet that is then decoded alone
+    // (armKeyframeDecode).
     [[nodiscard]] std::expected<void, Error> positionFor (std::int64_t P, bool keyframeMode, const CancelToken& token)
     {
         positioner.resetBackoff();
@@ -889,10 +890,10 @@ private:
         return positionScanned (P, keyframeMode, token);
     }
 
-    /// Containers with a trusted index (MP4, Matroska): seek to the target, read the landing
-    /// keyframe packet, and correct an overshoot (fragmented MP4, open-GOP leading pictures) with a
-    /// re-seek to the previous keyframe. Where each of those aims is Positioner's; this performs
-    /// them and reads the landings in between.
+    // Containers with a trusted index (MP4, Matroska): seek to the target, read the landing
+    // keyframe packet, and correct an overshoot (fragmented MP4, open-GOP leading pictures) with a
+    // re-seek to the previous keyframe. Where each of those aims is Positioner's; this performs
+    // them and reads the landings in between.
     [[nodiscard]] std::expected<void, Error> positionIndexed (std::int64_t P, bool keyframeMode,
                                                               const CancelToken& token)
     {
@@ -941,9 +942,9 @@ private:
         return {};
     }
 
-    /// Containers without a trusted index (MPEG-TS): position with a byte seek when the keyframe
-    /// covering P is already known; otherwise aim one GOP early, scan the packets up to the target
-    /// and choose the last keyframe at or before it (recording every keyframe on the way).
+    // Containers without a trusted index (MPEG-TS): position with a byte seek when the keyframe
+    // covering P is already known; otherwise aim one GOP early, scan the packets up to the target
+    // and choose the last keyframe at or before it (recording every keyframe on the way).
     [[nodiscard]] std::expected<void, Error> positionScanned (std::int64_t P, bool keyframeMode,
                                                               const CancelToken& token)
     {
@@ -971,8 +972,8 @@ private:
         }
     }
 
-    /// Retreats after a landing proved to be past `P`: Positioner picks the new target (or gives
-    /// up and sends us to the start), this performs the seek it asked for.
+    // Retreats after a landing proved to be past `P`: Positioner picks the new target (or gives
+    // up and sends us to the start), this performs the seek it asked for.
     [[nodiscard]] std::expected<void, Error> backOff (std::int64_t P, std::int64_t observedKey /* or k::noPts */)
     {
         const Positioner::Aim aim = positioner.nextBackoff (P, observedKey, positioningView());
@@ -1005,13 +1006,13 @@ private:
     // One frame of look-ahead past the held frame -- what proves the held frame covers the request.
     void pendReceived (bool concealed) noexcept { pending.adopt (decoder.getFrame(), concealed); }
 
-    /// Pulls one frame into the decoder's frame. Returns 0, k::eof, k::eagain (needs a packet) or
-    /// an error.
-    ///
-    /// The one thing added to VideoDecoder::receive(): once the drain has started, "nothing yet" is
-    /// the end of the stream rather than a request for another packet. Whether a drain is in
-    /// progress is the decode loop's own state, so the translation is made here and not inside the
-    /// decoder.
+    // Pulls one frame into the decoder's frame. Returns 0, k::eof, k::eagain (needs a packet) or
+    // an error.
+    //
+    // The one thing added to VideoDecoder::receive(): once the drain has started, "nothing yet" is
+    // the end of the stream rather than a request for another packet. Whether a drain is in
+    // progress is the decode loop's own state, so the translation is made here and not inside the
+    // decoder.
     [[nodiscard]] int receiveOne() noexcept
     {
         const int r = decoder.receive();
@@ -1020,8 +1021,8 @@ private:
         return r;
     }
 
-    /// Sends the reader's live packet. Returns 0 (consumed), k::eagain (kept for a retry after the
-    /// decoder has been drained) or an error (packet dropped).
+    // Sends the reader's live packet. Returns 0 (consumed), k::eagain (kept for a retry after the
+    // decoder has been drained) or an error (packet dropped).
     [[nodiscard]] int sendHeldPacket() noexcept
     {
         AVPacket& pkt = packets.getPacket();
@@ -1046,10 +1047,10 @@ private:
         return s;
     }
 
-    /// PacketReader::readLanding() plus the part only positioning may carry out. The scan reads
-    /// packets and chooses the keyframe; going back to one is a seek, and seeks are not the
-    /// reader's. Returned as data rather than done in place so the dependency runs one way:
-    /// positioning drives the reader, never the other way round.
+    // PacketReader::readLanding() plus the part only positioning may carry out. The scan reads
+    // packets and chooses the keyframe; going back to one is a seek, and seeks are not the
+    // reader's. Returned as data rather than done in place so the dependency runs one way:
+    // positioning drives the reader, never the other way round.
     [[nodiscard]] std::expected<PacketReader::Landing, Error> readLanding (std::int64_t P, bool scan, bool keyframeMode,
                                                                            const CancelToken& token)
     {
@@ -1072,10 +1073,10 @@ private:
         return land;
     }
 
-    /// Keyframe mode after positioning: feed the pending keyframe packet and drain, so the decoder
-    /// emits that one frame at once instead of after a pipeline's worth of packets (frame threads
-    /// hold ~thread_count packets). The decoder must be flushed before it is fed again
-    /// (`frontier.drained`).
+    // Keyframe mode after positioning: feed the pending keyframe packet and drain, so the decoder
+    // emits that one frame at once instead of after a pipeline's worth of packets (frame threads
+    // hold ~thread_count packets). The decoder must be flushed before it is fed again
+    // (`frontier.drained`).
     [[nodiscard]] std::expected<void, Error> armKeyframeDecode (const CancelToken& token)
     {
         if (! packets.isPacketPending())
@@ -1097,13 +1098,13 @@ private:
         decoder.startDrain();
         frontier.draining = true;
         frontier.drained = true;
-        position.markLandingKnown();
+        frontier.landingKnown = true; // this keyframe is the answer; select() need not prove it again
         return {};
     }
 
-    /// Reads the next packet of our stream and feeds it. Returns 0, k::eof (drain started),
-    /// k::exitRequested (interrupted) or a decoder error.
-    /// Not noexcept: the skipped-frame record below it allocates.
+    // Reads the next packet of our stream and feeds it. Returns 0, k::eof (drain started),
+    // k::exitRequested (interrupted) or a decoder error.
+    // Not noexcept: the skipped-frame record below it allocates.
     [[nodiscard]] int feedOne (const CancelToken& token)
     {
         if (packets.isPacketPending())
@@ -1165,14 +1166,14 @@ private:
         }
     }
 
-    /// Before a packet goes to the decoder: non-reference frames far before the target are skipped
-    /// at the decoder level (AVDISCARD_NONREF).
-    ///
-    /// A frame may be skipped only when its display interval provably ends before the window.
-    /// Durations cannot prove that (mov stores decode-order deltas, so a VFR stream's frame may say
-    /// "1/30 s"), nor can the average frame rate. What does: a frame with a *later* presentation
-    /// time has already been fed (B-frames follow their forward reference in decode order) and that
-    /// later time is itself before the window.
+    // Before a packet goes to the decoder: non-reference frames far before the target are skipped
+    // at the decoder level (AVDISCARD_NONREF).
+    //
+    // A frame may be skipped only when its display interval provably ends before the window.
+    // Durations cannot prove that (mov stores decode-order deltas, so a VFR stream's frame may say
+    // "1/30 s"), nor can the average frame rate. What does: a frame with a *later* presentation
+    // time has already been fed (B-frames follow their forward reference in decode order) and that
+    // later time is itself before the window.
     void prepareSend()
     {
         const AVPacket& pkt = packets.getPacket();
@@ -1194,7 +1195,7 @@ private:
         decoder.setSkipPolicy (skip);
     }
 
-    /// Core selection loop. Precondition: positioned (or continuing forward).
+    // Core selection loop. Precondition: positioned (or continuing forward).
     [[nodiscard]] std::expected<Selected, Error> select (std::int64_t P, std::int64_t lo, std::int64_t hi,
                                                          const CancelToken& token)
     {
@@ -1247,14 +1248,15 @@ private:
                 if (keyframeOnly)
                 {
                     // "The keyframe at or before P": the fed keyframe after a packet-level landing
-                    // (isLandingKnown), or the first keyframe out after a seek aimed at P itself. After a
+                    // (frontier.landingKnown), or the first keyframe out after a seek aimed at P itself.
+                    // After a
                     // back-off (the seek target is below P) that guarantee is gone: keep decoding,
                     // remembering the last keyframe <= P, until a frame past P shows up.
                     if (t <= P)
                     {
                         if (key || ! held.isValid()) holdReceived (concealed); // a non-key frame only as a fallback
                         if (key
-                            && (position.isLandingKnown() || t == P
+                            && (frontier.landingKnown || t == P
                                 || (frontier.receivedSinceSeek == 1 && position.getSeekTarget() == P)))
                         {
                             return Selected{ held.getFrame(), Adjustment::none, held.isConcealed() };
@@ -1401,8 +1403,8 @@ private:
         const auto finish = [&] (AVFrame* f, bool corrupt) -> std::expected<Selected, Error>
         {
             const std::int64_t t = getFrameTs (*f);
-            // In keyframe mode the stream extends past the held keyframe to the last frame decoded after
-            // it.
+            // In keyframe mode the stream extends past the held keyframe to the last frame
+            // decoded after it.
             const std::int64_t end = std::max (t + getFrameDuration (*f), keyframeOnly ? frontier.lastEnd : t);
 
             if (P < end) return Selected{ f, Adjustment::none, corrupt };
@@ -1436,11 +1438,11 @@ private:
         return fail (ErrorCode::endOfStream, "the stream ended before a frame for the requested time was decoded");
     }
 
-    /// Nearest-keyframe mode answers with the keyframe at or before P without decoding past it, so it
-    /// cannot tell a long GOP from the tail of a truncated file: a request past the end would come
-    /// back as the last keyframe, unflagged, where exact mode reports timeOutOfRange. When the
-    /// chosen keyframe is more than a GOP behind the request, read ahead (packets only) until one
-    /// proves the stream reaches P or the source ends. Remembered in tailEnd: once per source.
+    // Nearest-keyframe mode answers with the keyframe at or before P without decoding past it, so it
+    // cannot tell a long GOP from the tail of a truncated file: a request past the end would come
+    // back as the last keyframe, unflagged, where exact mode reports timeOutOfRange. When the
+    // chosen keyframe is more than a GOP behind the request, read ahead (packets only) until one
+    // proves the stream reaches P or the source ends. Remembered in tailEnd: once per source.
     [[nodiscard]] std::expected<Selected, Error> verifyKeyframeTail (Selected sel, std::int64_t P,
                                                                      const CancelToken& token)
     {
@@ -1494,26 +1496,26 @@ private:
                                                     + ")");
     }
 
-    /// Whether the held frame really is the last frame in presentation order of everything decoded
-    /// since positioning. It is, for every monotonic stream. It is not on a container whose
-    /// timestamps jump backwards (two recordings concatenated into one MPEG-TS, a camera restart):
-    /// decoding forward across the jump ends with a frame from the *earlier* segment, and concluding
-    /// "the stream has no frame past this one" from it strands the generator, because the
-    /// end-of-stream shortcut then answers every later request without ever repositioning.
+    // Whether the held frame really is the last frame in presentation order of everything decoded
+    // since positioning. It is, for every monotonic stream. It is not on a container whose
+    // timestamps jump backwards (two recordings concatenated into one MPEG-TS, a camera restart):
+    // decoding forward across the jump ends with a frame from the *earlier* segment, and concluding
+    // "the stream has no frame past this one" from it strands the generator, because the
+    // end-of-stream shortcut then answers every later request without ever repositioning.
     [[nodiscard]] bool isHeldFrameAtTail() const noexcept
     {
         if (! held.isValid()) return false;
         return getFrameTs (*held.getFrame()) + getFrameDuration (*held.getFrame()) >= frontier.lastEnd;
     }
 
-    /// Whether the held frame is the one on screen at `target`, as far as the frontier can say.
-    ///
-    /// The invariant: the held frame's display interval starts at or before `target` and every frame
-    /// between the two was produced. A frame skipped in between is the one on screen instead, so the
-    /// held frame does not cover `target` after all, whatever the look-ahead or the end of stream
-    /// say. What rules out a *later* frame covering `target` is mode-specific and stays with the
-    /// caller: the look-ahead frame or the end of stream in exact mode, the absence of a keyframe in
-    /// (held, target] in nearest-keyframe mode.
+    // Whether the held frame is the one on screen at `target`, as far as the frontier can say.
+    //
+    // The invariant: the held frame's display interval starts at or before `target` and every frame
+    // between the two was produced. A frame skipped in between is the one on screen instead, so the
+    // held frame does not cover `target` after all, whatever the look-ahead or the end of stream
+    // say. What rules out a *later* frame covering `target` is mode-specific and stays with the
+    // caller: the look-ahead frame or the end of stream in exact mode, the absence of a keyframe in
+    // (held, target] in nearest-keyframe mode.
     [[nodiscard]] bool isHeldFrameCovering (std::int64_t target) const noexcept
     {
         if (! held.isValid()) return false; // guards getFrame()
@@ -1521,11 +1523,11 @@ private:
         return h <= target && ! frontier.skipped.containsIn (h, target);
     }
 
-    /// Whether the look-ahead frame can become the held frame and the decode continue from there.
-    ///
-    /// The invariant: the pending frame begins at or before `target`, so the frame on screen at
-    /// `target` is it or one the decoder has yet to produce; every frame between it and `target` will
-    /// be produced; and reaching `target` that way costs less than seeking to it.
+    // Whether the look-ahead frame can become the held frame and the decode continue from there.
+    //
+    // The invariant: the pending frame begins at or before `target`, so the frame on screen at
+    // `target` is it or one the decoder has yet to produce; every frame between it and `target` will
+    // be produced; and reaching `target` that way costs less than seeking to it.
     [[nodiscard]] bool canPromotePendingFrame (std::int64_t target) const noexcept
     {
         if (! pending.isValid() || frontier.drained) return false; // isValid() guards getFrame()
@@ -1534,14 +1536,14 @@ private:
                && positioner.isForwardCheaperThanSeek (target, positioningView());
     }
 
-    /// Whether the request can be answered without repositioning, by decoding on from the held frame.
-    ///
-    /// The invariant: the decoder's next output is the frame after the held one, and every frame
-    /// between the held frame and `target` will be produced. An empty look-ahead slot is what says
-    /// nothing past the held frame has been received; `eof` and `drained` say the decoder has no more
-    /// to give without a flush; a recorded hole says one of the frames in between was skipped and
-    /// never will be produced. Any of those failing leaves the frame on screen at `target`
-    /// unestablishable from here, and the request has to position.
+    // Whether the request can be answered without repositioning, by decoding on from the held frame.
+    //
+    // The invariant: the decoder's next output is the frame after the held one, and every frame
+    // between the held frame and `target` will be produced. An empty look-ahead slot is what says
+    // nothing past the held frame has been received; `eof` and `drained` say the decoder has no more
+    // to give without a flush; a recorded hole says one of the frames in between was skipped and
+    // never will be produced. Any of those failing leaves the frame on screen at `target`
+    // unestablishable from here, and the request has to position.
     [[nodiscard]] bool canContinueFromHeldFrame (std::int64_t target) const noexcept
     {
         if (! held.isValid() || pending.isValid() || frontier.eof || frontier.drained)
@@ -1554,7 +1556,7 @@ private:
                && positioner.isForwardCheaperThanSeek (target, positioningView());
     }
 
-    /// Positions and selects (the caller converts).
+    // Positions and selects (the caller converts).
     [[nodiscard]] std::expected<Selected, Error> extract (std::int64_t P, std::int64_t lo, std::int64_t hi,
                                                           Adjustment clampedByBounds, const CancelToken& token)
     {
@@ -1716,41 +1718,41 @@ private:
     AssetInfo info;
     std::optional<Converter> converter;
 
-    KeyframeIndex keys; ///< where the keyframes are; the reader records into it as it reads
+    KeyframeIndex keys; // where the keyframes are; the reader records into it as it reads
     PacketReader packets;
-    Positioner positioner; ///< decides where to seek; the seeking itself is done here
+    Positioner positioner; // decides where to seek; the seeking itself is done here
     FrameSlot held, pending, corruptLast;
-    DecodeFrontier frontier; ///< where the decoder is; every reposition resets it
-    Position position;       ///< where the demuxer is; written only through its own verbs
-    SeekCostModel costs;     ///< what a seek and a frame cost; drives isForwardCheaperThanSeek()
+    DecodeFrontier frontier; // where the decoder is; every reposition resets it
+    Position position;       // where the demuxer is; written only through its own verbs
+    SeekCostModel costs;     // what a seek and a frame cost; drives isForwardCheaperThanSeek()
     const AVFrame* probeFrame{ nullptr };
-    /// One re-position per request after an end of stream that decoded nothing (see select()).
+    // One re-position per request after an end of stream that decoded nothing (see select()).
     bool eofRetried{ false };
-    bool keyframeOnly{ false }; ///< the current request is in nearest-keyframe mode
+    bool keyframeOnly{ false }; // the current request is in nearest-keyframe mode
     std::int64_t firstFrameTs{ k::noPts };
-    std::optional<Size> reqMax;            ///< RequestOptions::maximumSize of the current request
-    std::int64_t skipBeforeTs{ k::noPts }; ///< packets whose frames end before this may skip non-reference frames
-    std::int64_t tailEnd{ k::noPts };      ///< end of the data once the end of stream has been observed
-                                           ///< (k::noPts = not yet)
+    std::optional<Size> reqMax;            // RequestOptions::maximumSize of the current request
+    std::int64_t skipBeforeTs{ k::noPts }; // packets whose frames end before this may skip non-reference frames
+    std::int64_t tailEnd{ k::noPts };      // end of the data once the end of stream has been observed
+                                           // (k::noPts = not yet)
     int decodeErrors{ 0 };
     long totalDecodeErrors{ 0 };
-    /// Why this pipeline is currently unusable: a re-open that failed, or a software decoder that
-    /// could not be rebuilt after a hardware failure. Not the source's and not the decoder's —
-    /// either of them being dead is what makes the pipeline dead, and the one reader
-    /// (selectFor's "the generator is unusable") tests both. The pipeline retries on the next
-    /// request.
+    // Why this pipeline is currently unusable: a re-open that failed, or a software decoder that
+    // could not be rebuilt after a hardware failure. Not the source's and not the decoder's —
+    // either of them being dead is what makes the pipeline dead, and the one reader
+    // (selectFor's "the generator is unusable") tests both. The pipeline retries on the next
+    // request.
     std::string brokenReason;
 
-    /// Where the sub-objects' lifetime counters stood when the current request started, reset at
-    /// the start of each one. Not observability: SeekCostModel::learn() is fed the frames this
-    /// request decoded, and isForwardCheaperThanSeek() decides seek-versus-decode-forward from the
-    /// averages it maintains. Decoding thread only.
+    // Where the sub-objects' lifetime counters stood when the current request started, reset at
+    // the start of each one. Not observability: SeekCostModel::learn() is fed the frames this
+    // request decoded, and isForwardCheaperThanSeek() decides seek-versus-decode-forward from the
+    // averages it maintains. Decoding thread only.
     struct RequestStats
     {
-        /// MediaSource's lifetime seek count when this request started; getSeekCount() differences it.
+        // MediaSource's lifetime seek count when this request started; getSeekCount() differences it.
         std::int64_t seeksAtStart{ 0 };
-        /// VideoDecoder's lifetime frame count when this request started; getDecodedFrameCount()
-        /// differences it. Counts look-ahead and skipped frames, like the counter it comes from.
+        // VideoDecoder's lifetime frame count when this request started; getDecodedFrameCount()
+        // differences it. Counts look-ahead and skipped frames, like the counter it comes from.
         std::int64_t framesAtStart{ 0 };
     };
 

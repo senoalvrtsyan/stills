@@ -43,14 +43,17 @@ namespace stills::detail
 class PacketReader
 {
 public:
-    /// Allocates the live packet and the parking slot. Runs after every MediaSource open and
-    /// re-open, because both belong to the run over one container.
-    ///
-    /// It does *not* clear the replay buffer, matching what the pipeline did before this type
-    /// existed: reopen() does not reset the position either, and every path that re-opens reaches
-    /// readLanding() next, whose first act is clearGopBuffer(). Now that one type owns the buffer
-    /// that is a guarantee worth making here instead of relying on the caller -- but it would be a
-    /// behaviour change, so it belongs to the step that owns re-opening, not to this one.
+    // Allocates the live packet and the parking slot. Runs after every MediaSource open and
+    // re-open, because both belong to the run over one container.
+    //
+    // It does *not* clear the replay buffer, and that is deliberate rather than an oversight — the
+    // pipeline did not clear it here before this type existed either. What makes a buffer surviving
+    // a re-open harmless is that reopen() does not reset the decode position, and every path that
+    // re-opens reaches readLanding() next, whose first act is clearGopBuffer(). So nothing ever
+    // replays packets read from the container that was closed. Clearing it here would be tighter,
+    // now that one type owns the buffer, but it would change behaviour on a path nothing currently
+    // reaches, and this revision does not fix latent hazards inside a restructuring step. It is in
+    // the note to the reviewer instead.
     [[nodiscard]] std::expected<void, Error> attach()
     {
         auto p = makePacket();
@@ -65,10 +68,10 @@ public:
         return {};
     }
 
-    /// Drops everything tied to where the demuxer was: the replay buffer, the packet held for a
-    /// retry, the parked keyframe and the run of absorbed demux errors. What the reader has learned
-    /// about the *stream* (whether keyframe flags are reliable, how far packets have been read)
-    /// deliberately survives: a reposition does not un-read what was read.
+    // Drops everything tied to where the demuxer was: the replay buffer, the packet held for a
+    // retry, the parked keyframe and the run of absorbed demux errors. What the reader has learned
+    // about the *stream* (whether keyframe flags are reliable, how far packets have been read)
+    // deliberately survives: a reposition does not un-read what was read.
     void resetPosition() noexcept
     {
         clearGopBuffer();
@@ -80,58 +83,58 @@ public:
         if (landPkt) av_packet_unref (landPkt.get());
     }
 
-    /// A re-opened (or grown) source may reach further than the old one did, so what was read from
-    /// the old one proves nothing about the new one.
+    // A re-opened (or grown) source may reach further than the old one did, so what was read from
+    // the old one proves nothing about the new one.
     void resetVerifiedTo() noexcept { verifiedTo = k::noPts; }
 
-    /// The live packet. Valid from attach() onwards; the pipeline has none before it opens.
+    // The live packet. Valid from attach() onwards; the pipeline has none before it opens.
     [[nodiscard]] AVPacket& getPacket() noexcept { return *pkt; }
     [[nodiscard]] const AVPacket& getPacket() const noexcept { return *pkt; }
 
-    /// True when the live packet is being held for a retry: it has not been consumed and must be
-    /// sent again unchanged.
+    // True when the live packet is being held for a retry: it has not been consumed and must be
+    // sent again unchanged.
     [[nodiscard]] bool isPacketPending() const noexcept { return pktPending; }
 
-    /// The decoder refused the packet (EAGAIN): keep it, unchanged, for the next send.
+    // The decoder refused the packet (EAGAIN): keep it, unchanged, for the next send.
     void holdPacketForRetry() noexcept { pktPending = true; }
 
-    /// The packet has been consumed, or the retry is being abandoned: unref it and stop holding it.
+    // The packet has been consumed, or the retry is being abandoned: unref it and stop holding it.
     void releasePacket() noexcept
     {
         av_packet_unref (pkt.get());
         pktPending = false;
     }
 
-    /// Drops the live packet's contents and deliberately leaves the pending flag as it was: the
-    /// caller read this packet only to look at it, and whether a *retry* is owed for some earlier
-    /// packet is a separate question it has no business answering.
-    ///
-    /// The distinction from releasePacket() is not cosmetic. At the keyframe-tail check
-    /// (FramePipeline::verifyKeyframeTail) the flag can still be set from a send that returned
-    /// EAGAIN, over a packet this very loop has already overwritten. Clearing it there would be a
-    /// behaviour change, not a tidy-up: what makes that state safe is that the loop ends with
-    /// `position.markInvalid()`, so the next request repositions and resetPosition() clears the
-    /// flag before anything could send the packet. Do not collapse the two without moving that
-    /// guarantee.
+    // Drops the live packet's contents and deliberately leaves the pending flag as it was: the
+    // caller read this packet only to look at it, and whether a *retry* is owed for some earlier
+    // packet is a separate question it has no business answering.
+    //
+    // The distinction from releasePacket() is not cosmetic. At the keyframe-tail check
+    // (FramePipeline::verifyKeyframeTail) the flag can still be set from a send that returned
+    // EAGAIN, over a packet this very loop has already overwritten. Clearing it there would be a
+    // behaviour change, not a tidy-up: what makes that state safe is that the loop ends with
+    // `position.markInvalid()`, so the next request repositions and resetPosition() clears the
+    // flag before anything could send the packet. Do not collapse the two without moving that
+    // guarantee.
     void unrefPacket() noexcept { av_packet_unref (pkt.get()); }
 
-    /// Whether the demuxer flags keyframe packets at all. Learned from the very first packet of the
-    /// stream: a demuxer that never sets the flag must not make the pipeline skip.
+    // Whether the demuxer flags keyframe packets at all. Learned from the very first packet of the
+    // stream: a demuxer that never sets the flag must not make the pipeline skip.
     [[nodiscard]] bool areKeyFlagsReliable() const noexcept { return keyFlagsReliable; }
 
-    /// The largest packet presentation time actually read from the source, k::noPts if none. This
-    /// is evidence that the stream reaches that far, which a decoded frame alone is not.
+    // The largest packet presentation time actually read from the source, k::noPts if none. This
+    // is evidence that the stream reaches that far, which a decoded frame alone is not.
     [[nodiscard]] std::int64_t getVerifiedTo() const noexcept { return verifiedTo; }
 
-    /// Reads the next packet of our stream into the live packet (other streams are dropped), and
-    /// tells the keyframe index about it. Returns 0, k::eof (after a live-source growth check),
-    /// k::exitRequested or a demux error (transient ones are skipped up to a limit).
-    ///
-    /// `tainted` is set — never cleared — when a demux error forced packets to be skipped: there is
-    /// a hole in what the decoder will be fed, and the caller owns the state that records it.
-    ///
-    /// Not noexcept: the keyframe index this records into allocates. A std::bad_alloc here would be
-    /// std::terminate rather than the ErrorCode::outOfMemory the API can report.
+    // Reads the next packet of our stream into the live packet (other streams are dropped), and
+    // tells the keyframe index about it. Returns 0, k::eof (after a live-source growth check),
+    // k::exitRequested or a demux error (transient ones are skipped up to a limit).
+    //
+    // `tainted` is set — never cleared — when a demux error forced packets to be skipped: there is
+    // a hole in what the decoder will be fed, and the caller owns the state that records it.
+    //
+    // Not noexcept: the keyframe index this records into allocates. A std::bad_alloc here would be
+    // std::terminate rather than the ErrorCode::outOfMemory the API can report.
     [[nodiscard]] int readVideoPacket (MediaSource& source, KeyframeIndex& keys, bool& tainted,
                                        const CancelToken& token)
     {
@@ -139,7 +142,6 @@ public:
         {
             // Replayed packets were recorded when they were first read; recording one twice would drag
             // the index's contiguity cursor backwards.
-            // Packets scanned past the chosen keyframe are replayed; the demuxer sits right after them.
             av_packet_unref (pkt.get());
             av_packet_move_ref (pkt.get(), gopBuffer[replayPos].get());
 
@@ -188,12 +190,12 @@ public:
         }
     }
 
-    /// What readLanding() established, plus the two things only the caller may act on.
+    // What readLanding() established, plus the two things only the caller may act on.
     struct Landing
     {
-        /// How the caller must get back to the chosen keyframe before it can be decoded. The scan
-        /// necessarily reads past that keyframe, so when its GOP was too large to keep in memory
-        /// someone has to go back to it — and seeking belongs to positioning, not to the reader.
+        // How the caller must get back to the chosen keyframe before it can be decoded. The scan
+        // necessarily reads past that keyframe, so when its GOP was too large to keep in memory
+        // someone has to go back to it — and seeking belongs to positioning, not to the reader.
         enum class Rewind
         {
             none,
@@ -201,31 +203,31 @@ public:
             timestampSeek
         };
 
-        bool found{ false };                  ///< a keyframe packet at or before P is ready (pending or positioned)
-        std::int64_t firstKeyPts{ k::noPts }; ///< the first keyframe packet seen (> P when !found)
+        bool found{ false };                  // a keyframe packet at or before P is ready (pending or positioned)
+        std::int64_t firstKeyPts{ k::noPts }; // the first keyframe packet seen (> P when !found)
         std::int64_t firstKeyDts{ k::noPts };
         bool eof{ false };
-        /// The chosen keyframe's GOP is buffered for replay, so the next packet the decoder sees is
-        /// that keyframe: the caller's positioning state must say a keyframe is still awaited.
+        // The chosen keyframe's GOP is buffered for replay, so the next packet the decoder sees is
+        // that keyframe: the caller's positioning state must say a keyframe is still awaited.
         bool awaitKey{ false };
         Rewind rewind{ Rewind::none };
-        KeyEntry rewindEntry{};            ///< Rewind::byteSeek: the keyframe to seek back to
-        std::int64_t rewindTs{ k::noPts }; ///< Rewind::timestampSeek: the timestamp to aim at
+        KeyEntry rewindEntry{};            // Rewind::byteSeek: the keyframe to seek back to
+        std::int64_t rewindTs{ k::noPts }; // Rewind::timestampSeek: the timestamp to aim at
     };
 
-    /// Establishes where a seek landed from the packets, without decoding.
-    ///
-    /// Two of its outcomes are the caller's to carry out and are returned rather than performed:
-    /// `rewind` (a seek, which belongs to positioning) and `awaitKey` (the buffered GOP starts at
-    /// the chosen keyframe, so the caller's positioning state must still say one is awaited).
-    /// Ignoring either would feed the decoder a mid-GOP packet stream.
-    /// FramePipeline::readLanding() is the one caller and does both; anything else that calls this
-    /// owes them too.
-    /// `scan == false` (trusted
-    /// index): the first keyframe packet is the landing; it is held for the decoder when it
-    /// is at or before P. `scan == true` (no index): keeps reading through the GOPs up to P, records
-    /// every keyframe, and settles on the last keyframe at or before P — held for a
-    /// keyframe-only decode, or reached again with a byte seek for an exact decode.
+    // Establishes where a seek landed from the packets, without decoding.
+    //
+    // Two of its outcomes are the caller's to carry out and are returned rather than performed:
+    // `rewind` (a seek, which belongs to positioning) and `awaitKey` (the buffered GOP starts at
+    // the chosen keyframe, so the caller's positioning state must still say one is awaited).
+    // Ignoring either would feed the decoder a mid-GOP packet stream.
+    // FramePipeline::readLanding() is the one caller and does both; anything else that calls this
+    // owes them too.
+    //
+    // `scan == false` (trusted index): the first keyframe packet is the landing, held for the
+    // decoder when it is at or before P. `scan == true` (no index): keeps reading through the GOPs
+    // up to P, records every keyframe, and settles on the last keyframe at or before P — held for a
+    // keyframe-only decode, or reached again with a byte seek for an exact decode.
     [[nodiscard]] std::expected<Landing, Error> readLanding (MediaSource& source, KeyframeIndex& keys, std::int64_t P,
                                                              bool scan, bool keyframeMode, bool& tainted,
                                                              const CancelToken& token)
@@ -418,12 +420,12 @@ public:
     }
 
 private:
-    /// True when the next read will be served from the replay buffer rather than the demuxer.
+    // True when the next read will be served from the replay buffer rather than the demuxer.
     [[nodiscard]] bool isServingReplay() const noexcept { return replaying && replayPos < gopBuffer.size(); }
 
-    /// Keeps the live packet for replay (the landing scan). False when the cap is exceeded, which
-    /// also empties the buffer: a partial GOP is worse than none, because replaying it would feed
-    /// the decoder frames whose references were never sent.
+    // Keeps the live packet for replay (the landing scan). False when the cap is exceeded, which
+    // also empties the buffer: a partial GOP is worse than none, because replaying it would feed
+    // the decoder frames whose references were never sent.
     [[nodiscard]] bool bufferPacket()
     {
         const std::size_t bytes = static_cast<std::size_t> (std::max (pkt->size, 0));
@@ -458,21 +460,21 @@ private:
         replaying = false;
     }
 
-    /// Whether the scan buffered anything to replay.
+    // Whether the scan buffered anything to replay.
     [[nodiscard]] bool hasBufferedGop() const noexcept { return ! gopBuffer.empty(); }
 
-    /// The scan is over and the buffered GOP is the answer: reads are served from it until it runs
-    /// out, and the demuxer picks up exactly where the scan left it.
+    // The scan is over and the buffered GOP is the answer: reads are served from it until it runs
+    // out, and the demuxer picks up exactly where the scan left it.
     void beginReplay() noexcept { replaying = true; }
 
-    /// Parks the live packet (keyframe mode: the chosen keyframe, while the scan reads on past it).
+    // Parks the live packet (keyframe mode: the chosen keyframe, while the scan reads on past it).
     void parkPacket() noexcept
     {
         av_packet_unref (landPkt.get());
         av_packet_move_ref (landPkt.get(), pkt.get());
     }
 
-    /// Makes the parked keyframe the live packet again, held for the decoder.
+    // Makes the parked keyframe the live packet again, held for the decoder.
     void takeParkedPacket() noexcept
     {
         av_packet_unref (pkt.get());
@@ -480,24 +482,24 @@ private:
         pktPending = true;
     }
 
-    /// Scanned packets of the chosen GOP are kept for replay up to this much; beyond it (4K at high
-    /// bit rates) the pipeline goes back to the keyframe with a byte seek instead.
+    // Scanned packets of the chosen GOP are kept for replay up to this much; beyond it (4K at high
+    // bit rates) the pipeline goes back to the keyframe with a byte seek instead.
     static constexpr std::size_t maxGopBufferBytes = 64u << 20;
-    /// Matches the decoder's own limit in stills_FramePipeline.h; the two count unrelated things.
+    // Matches the decoder's own limit in stills_FramePipeline.h; the two count unrelated things.
     static constexpr int maxConsecutiveDemuxErrors = 32;
 
     PacketPtr pkt;
-    bool pktPending{ false };         ///< pkt holds a packet the decoder refused with EAGAIN
-    PacketPtr landPkt;                ///< keyframe mode: the chosen keyframe packet while scanning past it
-    std::vector<PacketPtr> gopBuffer; ///< exact mode: the chosen keyframe's packets scanned past P,
-                                      ///< replayed to the decoder
+    bool pktPending{ false };         // pkt holds a packet the decoder refused with EAGAIN
+    PacketPtr landPkt;                // keyframe mode: the chosen keyframe packet while scanning past it
+    std::vector<PacketPtr> gopBuffer; // exact mode: the chosen keyframe's packets scanned past P,
+                                      // replayed to the decoder
     std::size_t gopBufferBytes{ 0 };
     std::size_t replayPos{ 0 };
-    bool replaying{ false }; ///< the scan is over; readVideoPacket serves gopBuffer first
+    bool replaying{ false }; // the scan is over; readVideoPacket serves gopBuffer first
     int demuxErrors{ 0 };
     bool firstPacketSeen{ false };
-    bool keyFlagsReliable{ false };      ///< the demuxer flags keyframe packets (first packet was flagged)
-    std::int64_t verifiedTo{ k::noPts }; ///< largest packet presentation time actually read
+    bool keyFlagsReliable{ false };      // the demuxer flags keyframe packets (first packet was flagged)
+    std::int64_t verifiedTo{ k::noPts }; // largest packet presentation time actually read
 };
 
 } // namespace stills::detail

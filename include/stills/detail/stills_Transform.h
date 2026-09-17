@@ -14,15 +14,15 @@
 namespace stills::detail
 {
 
-/// Per-row mapping of a source row onto the destination: the destination cell of source (0, y) is
-/// (x0, y0) and every step in source x moves the destination by (dx, dy) cells.
+// Per-row mapping of a source row onto the destination: the destination cell of source (0, y) is
+// (x0, y0) and every step in source x moves the destination by (dx, dy) cells.
 struct RowMap
 {
     std::ptrdiff_t x0{ 0 }, y0{ 0 }, dx{ 1 }, dy{ 0 };
 };
 
-/// Where source row `y` of a `w` x `h` plane lands after rotating clockwise by `degrees` (the
-/// destination is `h` x `w` for 90/270) and optionally mirroring the result horizontally.
+// Where source row `y` of a `w` x `h` plane lands after rotating clockwise by `degrees` (the
+// destination is `h` x `w` for 90/270) and optionally mirroring the result horizontally.
 [[nodiscard]] constexpr RowMap rowMap (int degrees, bool mirror, int w, int h, int y) noexcept
 {
     RowMap m;
@@ -54,8 +54,8 @@ struct RowMap
     return m;
 }
 
-/// Copies one plane through `rowMap`. `Bpp` is the cell size in bytes; the loop body is a fixed-
-/// size copy so the compiler vectorises the common (contiguous) cases.
+// Copies one plane through `rowMap`. `Bpp` is the cell size in bytes; the loop body is a fixed-
+// size copy so the compiler vectorises the common (contiguous) cases.
 template <int Bpp>
 inline void transformPlaneBpp (const std::uint8_t* src, int srcStride, int w, int h, std::uint8_t* dst, int dstStride,
                                int degrees, bool mirror) noexcept
@@ -83,8 +83,8 @@ inline void transformPlaneBpp (const std::uint8_t* src, int srcStride, int w, in
     }
 }
 
-/// Dispatches on the cell size (1 = gray / planar Y,U,V; 2 = NV12 chroma pairs / P010 luma; 3 =
-/// RGB; 4 = RGBA / P010 chroma pairs; 8 = RGBA64).
+// Dispatches on the cell size (1 = gray / planar Y,U,V; 2 = NV12 chroma pairs / P010 luma; 3 =
+// RGB; 4 = RGBA / P010 chroma pairs; 8 = RGBA64).
 inline void transformPlane (const std::uint8_t* src, int srcStride, int w, int h, int bpp, std::uint8_t* dst,
                             int dstStride, int degrees, bool mirror) noexcept
 {
@@ -110,9 +110,9 @@ inline void transformPlane (const std::uint8_t* src, int srcStride, int w, int h
     }
 }
 
-/// Writes `src` rotated clockwise by `degrees` (then mirrored horizontally when `mirror` is set)
-/// into `dst`, an allocated frame of the transposed size (for 90/270) in the same format. `src`
-/// must be one of our output PixelFormats (software).
+// Writes `src` rotated clockwise by `degrees` (then mirrored horizontally when `mirror` is set)
+// into `dst`, an allocated frame of the transposed size (for 90/270) in the same format. `src`
+// must be one of our output PixelFormats (software).
 [[nodiscard]] inline std::expected<void, Error> transformInto (const AVFrame& src, AVFrame& dst, PixelFormat fmt,
                                                                int degrees, bool mirror)
 {
@@ -144,9 +144,9 @@ inline void transformPlane (const std::uint8_t* src, int srcStride, int w, int h
     return {};
 }
 
-/// Returns a new frame containing `src` rotated clockwise by `degrees` and then mirrored
-/// horizontally when `mirror` is set. `src` must be one of our output PixelFormats (software,
-/// 8-bit).
+// Returns a new frame containing `src` rotated clockwise by `degrees` and then mirrored
+// horizontally when `mirror` is set. `src` must be one of our output PixelFormats (software,
+// 8-bit).
 [[nodiscard]] inline std::expected<FramePtr, Error> transformFrame (const AVFrame& src, PixelFormat fmt, int degrees,
                                                                     bool mirror)
 {

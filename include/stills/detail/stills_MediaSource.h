@@ -27,8 +27,8 @@
 //
 // Not thread-safe: a FramePipeline is single-threaded by contract (stills_FramePipeline.h), and its
 // MediaSource is only ever touched by the thread running that pipeline. The one exception is the
-// interrupt
-// callback, which libavformat calls on the same thread from inside the I/O it is blocking in.
+// interrupt callback, which libavformat calls on the same thread from inside the I/O it is
+// blocking in.
 
 #include <algorithm>
 #include <atomic>
@@ -48,7 +48,7 @@
 namespace stills::detail
 {
 
-/// Cooperative cancellation: two optional flags (per-batch and per-generator).
+// Cooperative cancellation: two optional flags (per-batch and per-generator).
 struct CancelToken
 {
     const std::atomic<bool>* batch{ nullptr };
@@ -61,17 +61,17 @@ struct CancelToken
     }
 };
 
-/// Rotation and mirroring that display the coded picture upright, decoded from a display matrix.
+// Rotation and mirroring that display the coded picture upright, decoded from a display matrix.
 struct DisplayTransform
 {
-    int rotation{ 0 };      ///< clockwise degrees, one of 0/90/180/270
-    bool mirrored{ false }; ///< horizontal mirror, applied *after* the rotation
+    int rotation{ 0 };      // clockwise degrees, one of 0/90/180/270
+    bool mirrored{ false }; // horizontal mirror, applied *after* the rotation
 };
 
-/// Decodes a 3x3 display matrix (16.16 fixed point, row-vector convention: display = coded * M).
-/// A negative determinant means the matrix contains a reflection; av_display_rotation_get alone
-/// would misreport a pure horizontal flip as a 180 degree rotation. Splitting M = R * F (rotate,
-/// then mirror horizontally) covers all eight orientations exactly.
+// Decodes a 3x3 display matrix (16.16 fixed point, row-vector convention: display = coded * M).
+// A negative determinant means the matrix contains a reflection; av_display_rotation_get alone
+// would misreport a pure horizontal flip as a 180 degree rotation. Splitting M = R * F (rotate,
+// then mirror horizontally) covers all eight orientations exactly.
 [[nodiscard]] inline DisplayTransform decodeDisplayMatrix (const std::int32_t in[9]) noexcept
 {
     std::int32_t m[9];
@@ -97,9 +97,9 @@ struct DisplayTransform
     return t;
 }
 
-/// What the pipeline learned about the chosen video stream when the source was opened. Owned by
-/// MediaSource, which is the only thing that may write it; everything else reads it through
-/// MediaSource::getStreamInfo().
+// What the pipeline learned about the chosen video stream when the source was opened. Owned by
+// MediaSource, which is the only thing that may write it; everything else reads it through
+// MediaSource::getStreamInfo().
 struct StreamInfo
 {
     int index{ -1 };
@@ -107,31 +107,31 @@ struct StreamInfo
     std::int64_t startPts{ 0 };
     std::optional<std::int64_t> durationPts;
     std::int64_t frameDurationHint{ 0 };
-    AVRational containerSar{ 0, 1 }; ///< AVStream::sample_aspect_ratio (container level, wins)
-    AVRational codecSar{ 0, 1 };     ///< AVCodecParameters::sample_aspect_ratio (bitstream level)
+    AVRational containerSar{ 0, 1 }; // AVStream::sample_aspect_ratio (container level, wins)
+    AVRational codecSar{ 0, 1 };     // AVCodecParameters::sample_aspect_ratio (bitstream level)
     AVRational avgFrameRate{ 0, 1 };
     DisplayTransform transform;
-    bool seekable{ true };   ///< avformat_seek_file is usable (timestamps + seekable I/O)
-    bool ioSeekable{ true }; ///< the source can be rewound (a file, not a pipe)
-    /// The container carries no timestamps (raw elementary streams). libavformat then synthesises
-    /// decode-order counters that disagree with display order under B-frame reordering, so the
-    /// pipeline stamps decoded frames itself: output order x frame duration.
+    bool seekable{ true };   // avformat_seek_file is usable (timestamps + seekable I/O)
+    bool ioSeekable{ true }; // the source can be rewound (a file, not a pipe)
+    // The container carries no timestamps (raw elementary streams). libavformat then synthesises
+    // decode-order counters that disagree with display order under B-frame reordering, so the
+    // pipeline stamps decoded frames itself: output order x frame duration.
     bool synthesizeTimestamps{ false };
-    /// The container had a populated index right after avformat_find_stream_info (MP4, indexed
-    /// AVI/FLV). Indices that grow lazily during seeks (MPEG-TS flags every probed packet as a
-    /// keyframe) are never consulted for the forward-or-seek decision.
+    // The container had a populated index right after avformat_find_stream_info (MP4, indexed
+    // AVI/FLV). Indices that grow lazily during seeks (MPEG-TS flags every probed packet as a
+    // keyframe) are never consulted for the forward-or-seek decision.
     bool indexTrusted{ false };
 };
 
 class MediaSource
 {
 public:
-    /// What an interrupt left behind in libavio, once recoverAfterInterrupt() has done what it can.
+    // What an interrupt left behind in libavio, once recoverAfterInterrupt() has done what it can.
     enum class IoState
     {
-        clean,   ///< no interrupt state to clear; the source is readable as it stands
-        cleared, ///< the sticky end-of-file/error flags were cleared and the demuxer flushed
-        stuck,   ///< this libavformat major cannot be cleared in place; the caller must re-open
+        clean,   // no interrupt state to clear; the source is readable as it stands
+        cleared, // the sticky end-of-file/error flags were cleared and the demuxer flushed
+        stuck,   // this libavformat major cannot be cleared in place; the caller must re-open
     };
 
     explicit MediaSource (std::string sourcePath) : path (std::move (sourcePath)) {}
@@ -482,18 +482,18 @@ public:
     // gives libavformat.
     [[nodiscard]] bool isCancelled() const noexcept { return token != nullptr && token->isRequested(); }
 
-    /// An interrupt that fired inside libavformat I/O leaves the AVIOContext refusing to read. Clear
-    /// it and flush the demuxer; the caller forgets its position, because the next request must seek
-    /// (which resets the I/O layer properly) or, on a pipe, continue from where the read stopped.
-    ///
-    /// The state left behind is not reliably `error == AVERROR_EXIT` — the MPEG-TS demuxer turns the
-    /// short read into AVERROR_EOF, and a later seek clears `error` but not `eof_reached`, which on
-    /// its own is indistinguishable from a genuine EOF. So the interrupt is recorded when it fires
-    /// (interruptCallback) rather than inferred here, and consumed either way.
-    ///
-    /// Returns `stuck` when the sticky state could not be cleared in place -- a libavformat major
-    /// tryResetIoState() was never verified against -- and the source can be re-opened. The caller
-    /// must then re-establish it before the next read; nothing else clears the I/O layer.
+    // An interrupt that fired inside libavformat I/O leaves the AVIOContext refusing to read. Clear
+    // it and flush the demuxer; the caller forgets its position, because the next request must seek
+    // (which resets the I/O layer properly) or, on a pipe, continue from where the read stopped.
+    //
+    // The state left behind is not reliably `error == AVERROR_EXIT` — the MPEG-TS demuxer turns the
+    // short read into AVERROR_EOF, and a later seek clears `error` but not `eof_reached`, which on
+    // its own is indistinguishable from a genuine EOF. So the interrupt is recorded when it fires
+    // (interruptCallback) rather than inferred here, and consumed either way.
+    //
+    // Returns `stuck` when the sticky state could not be cleared in place -- a libavformat major
+    // tryResetIoState() was never verified against -- and the source can be re-opened. The caller
+    // must then re-establish it before the next read; nothing else clears the I/O layer.
     [[nodiscard]] IoState recoverAfterInterrupt() noexcept
     {
         const bool fired = std::exchange (interruptFired, false);
@@ -515,8 +515,8 @@ public:
     [[nodiscard]] bool tryResetIo() noexcept { return ! fmt || fmt->pb == nullptr || tryResetIoState (*fmt->pb); }
 
 private:
-    /// Consecutive avformat_seek_file failures (never counting interrupted I/O) before the source
-    /// stops seeking and the pipeline decodes forward / re-opens instead.
+    // Consecutive avformat_seek_file failures (never counting interrupted I/O) before the source
+    // stops seeking and the pipeline decodes forward / re-opens instead.
     static constexpr int maxSeekFailures = 3;
 
     static int interruptCallback (void* opaque) noexcept
@@ -535,9 +535,9 @@ private:
         return 0;
     }
 
-    /// Demuxer options libavformat left unconsumed *and* does not define anywhere: a misspelling.
-    /// A key it defines but did not apply here is legitimate — an HTTP option that a local path
-    /// never reaches — and is not reported. Returns them comma-separated, or empty.
+    // Demuxer options libavformat left unconsumed *and* does not define anywhere: a misspelling.
+    // A key it defines but did not apply here is legitimate — an HTTP option that a local path
+    // never reaches — and is not reported. Returns them comma-separated, or empty.
     [[nodiscard]] static std::string getUnknownDemuxerOptions (AVDictionary* left)
     {
         std::string bad;
@@ -555,8 +555,8 @@ private:
         return bad;
     }
 
-    /// Whether any of libavformat's option classes (the context, the demuxers, the protocols)
-    /// defines `key`.
+    // Whether any of libavformat's option classes (the context, the demuxers, the protocols)
+    // defines `key`.
     [[nodiscard]] static bool optionExists (const char* key) noexcept
     {
         const AVClass* fc = avformat_get_class();
@@ -573,9 +573,9 @@ private:
         return false;
     }
 
-    /// Options::maxInputPixels against what the container declared, before anything decodes. Only
-    /// refuses when *every* video stream is over the cap and has a declared size: a stream whose size
-    /// is unknown here is decided by the check in open() once stream info has been read.
+    // Options::maxInputPixels against what the container declared, before anything decodes. Only
+    // refuses when *every* video stream is over the cap and has a declared size: a stream whose size
+    // is unknown here is decided by the check in open() once stream info has been read.
     [[nodiscard]] std::expected<void, Error> checkDeclaredSize (const Options& opt) const
     {
         if (! opt.maxInputPixels) return {};
@@ -605,8 +605,8 @@ private:
                          + " pixels, over Options::maxInputPixels (" + std::to_string (*opt.maxInputPixels) + ")");
     }
 
-    /// The display transform from the stream's display matrix side data (codecpar->coded_side_data,
-    /// the non-deprecated path on FFmpeg 6.1 and 7.x).
+    // The display transform from the stream's display matrix side data (codecpar->coded_side_data,
+    // the non-deprecated path on FFmpeg 6.1 and 7.x).
     [[nodiscard]] static DisplayTransform readTransform (const AVCodecParameters& par) noexcept
     {
         const AVPacketSideData* sd =
@@ -618,21 +618,21 @@ private:
         return decodeDisplayMatrix (matrix);
     }
 
-    /// Clears libavio's sticky end-of-file / error state so reading can continue after an interrupt
-    /// inside a read. Poking `eof_reached` / `error` is not promised to keep the demuxer consistent,
-    /// so it is confined to the libavformat majors it was verified against -- 60 (FFmpeg 6.1),
-    /// 61 (7.1), 62 (8.0) and 63 (9.0), each one built and the suite run against it. On any other
-    /// major it changes nothing and returns false; the caller re-establishes the source instead,
-    /// which costs one re-open per interrupt recovery. That is the right trade against failing the
-    /// build, which would stop every consumer -- including the ones that never cancel -- over a
-    /// path they never reach.
-    ///
-    /// Why an unknown major cannot simply seek instead: a same-position avio_seek clears
-    /// `eof_reached` but leaves `error` set -- `s->eof_reached = 0` on every exit path, `s->error`
-    /// never assigned; read from source at n7.1.2 / n8.0 / n9.0.1 (avio_seek itself changed in 9,
-    /// this property did not) and confirmed behaviourally at 60 by the suite. And avio_read returns
-    /// `s->error` whenever it read nothing, while the case this function exists for is exactly
-    /// `pb->error == AVERROR_EXIT` -- so seeking alone would leave every later read failing.
+    // Clears libavio's sticky end-of-file / error state so reading can continue after an interrupt
+    // inside a read. Poking `eof_reached` / `error` is not promised to keep the demuxer consistent,
+    // so it is confined to the libavformat majors it was verified against -- 60 (FFmpeg 6.1),
+    // 61 (7.1), 62 (8.0) and 63 (9.0), each one built and the suite run against it. On any other
+    // major it changes nothing and returns false; the caller re-establishes the source instead,
+    // which costs one re-open per interrupt recovery. That is the right trade against failing the
+    // build, which would stop every consumer -- including the ones that never cancel -- over a
+    // path they never reach.
+    //
+    // Why an unknown major cannot simply seek instead: a same-position avio_seek clears
+    // `eof_reached` but leaves `error` set -- `s->eof_reached = 0` on every exit path, `s->error`
+    // never assigned; read from source at n7.1.2 / n8.0 / n9.0.1 (avio_seek itself changed in 9,
+    // this property did not) and confirmed behaviourally at 60 by the suite. And avio_read returns
+    // `s->error` whenever it read nothing, while the case this function exists for is exactly
+    // `pb->error == AVERROR_EXIT` -- so seeking alone would leave every later read failing.
     [[nodiscard]] static bool tryResetIoState (AVIOContext& pb) noexcept
     {
 #if LIBAVFORMAT_VERSION_MAJOR <= 63
@@ -648,12 +648,12 @@ private:
     std::string path;
     FormatCtxPtr fmt;
     AVStream* st{ nullptr };
-    const AVCodec* codecDesc{ nullptr }; ///< the decoder av_find_best_stream picked, not a context
+    const AVCodec* codecDesc{ nullptr }; // the decoder av_find_best_stream picked, not a context
     StreamInfo stream;
-    /// Set by interruptCallback() when it aborts libav I/O, consumed by recoverAfterInterrupt().
+    // Set by interruptCallback() when it aborts libav I/O, consumed by recoverAfterInterrupt().
     bool interruptFired{ false };
-    int seekFailures{ 0 }; ///< consecutive avformat_seek_file failures (interrupts excluded)
-    /// Seeks issued over this source's whole life; the pipeline differences it per request.
+    int seekFailures{ 0 }; // consecutive avformat_seek_file failures (interrupts excluded)
+    // Seeks issued over this source's whole life; the pipeline differences it per request.
     std::int64_t seekCalls{ 0 };
     const CancelToken* token{ nullptr };
 };
