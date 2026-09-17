@@ -10,6 +10,20 @@ option(STILLS_BUILD_EXAMPLES "Build the stills examples"   ${PROJECT_IS_TOP_LEVE
 option(STILLS_INSTALL        "Generate the stills install rules" ${PROJECT_IS_TOP_LEVEL})
 option(STILLS_WERROR         "Treat warnings as errors"    ON)
 
+# The library itself asks for C++23 through target_compile_features, which is all a consumer needs.
+# A top-level build also has to pin the standard globally, because it builds code we do not own:
+# the fetched Catch2 requires only cxx_std_14 and so compiles at the compiler's default, and Apple
+# Clang 17 then fails to link the test binary -- Catch2 conditionally compiles parts of its
+# interface on the language level, so our C++23 TUs can reference symbols the library never
+# emitted. Guarded on PROJECT_IS_TOP_LEVEL: as a subproject these variables belong to the consumer.
+# EXTENSIONS OFF is safe for us: time.hpp already spells its one extension `__extension__ using
+# int128 = __int128;` rather than relying on -std=gnu++23.
+if(PROJECT_IS_TOP_LEVEL)
+  set(CMAKE_CXX_STANDARD 23)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+  set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
+
 find_package(PkgConfig REQUIRED)
 # IMPORTED_TARGET_GLOBAL: the imported target is otherwise scoped to this directory, so an
 # add_subdirectory() consumer of <stills/interop.hpp> cannot link PkgConfig::FFMPEG itself.

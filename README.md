@@ -159,6 +159,7 @@ reference for every knob, including when you would want it.
 | Compiler | C++23 with `std::expected` and `__int128`: GCC 13+, Clang 17+ with libc++ 16+, Xcode 15+. **MSVC is not supported.** |
 | FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and run here against 6.1 only; 7.x and 8.x are syntax-checked, never executed. |
 | Build | CMake ≥ 3.25 and `Threads`. **Every preset specifies the Ninja generator**, so install `ninja` or configure by hand with `-G`. Catch2 v3.16.0 is fetched at configure time unless `find_package(Catch2 3)` finds one. |
+| Standard | A top-level build pins `CMAKE_CXX_STANDARD 23`, `..._REQUIRED ON`, `..._EXTENSIONS OFF`, and sets `CXX_STANDARD 23` on the fetched Catch2 targets: Catch2 asks only for `cxx_std_14`, and at the compiler's default it does not link against C++23 test TUs on Apple Clang 17. A consumer's settings are untouched. |
 | Fixtures | An `ffmpeg` **binary** (6.0+, for `-display_rotation` and `-fps_mode`) with `libx264`, and `python3` for one clip — which falls back to `tr` when absent. `libvpx-vp9` and `libx265` are optional; their tests skip themselves. |
 
 ```sh
@@ -169,6 +170,12 @@ brew install pkg-config ninja ffmpeg
 
 cmake --preset default && cmake --build --preset default && ctest --preset default
 ```
+
+> **If a system Catch2 is already installed.** `FIND_PACKAGE_ARGS 3` lets `find_package(Catch2 3)`
+> win over the fetch, and a found Catch2 arrives as an *imported* target — `CXX_STANDARD` on an
+> imported target does nothing, so a Homebrew Catch2 built at some other standard can reproduce
+> the very link failure the pinned standard is there to prevent. Configure with
+> `-DCMAKE_DISABLE_FIND_PACKAGE_Catch2=ON` to force the fetched copy, which is pinned.
 
 Four presets: `default` (Debug — `-O0`, `assert()` live, so the documented precondition asserts
 fire; time it with `release` instead), `release`, `asan` (Address + UndefinedBehaviour + Leak
