@@ -7,7 +7,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -24,8 +23,11 @@
 
 #include "stills/asset_info.hpp"
 #include "stills/detail/convert.hpp"
+#include "stills/detail/decode_frontier.hpp"
 #include "stills/detail/ffmpeg.hpp"
+#include "stills/detail/frame_slot.hpp"
 #include "stills/detail/hw.hpp"
+#include "stills/detail/seek_cost_model.hpp"
 #include "stills/image.hpp"
 #include "stills/options.hpp"
 #include "stills/time.hpp"
@@ -75,7 +77,7 @@ struct DisplayTransform {
 
 class Pipeline {
  public:
-  /// A frame chosen for a request, owned by the pipeline (held_ or a pending slot).
+  /// A frame chosen for a request, owned by the pipeline (one of its FrameSlots).
   struct Selected {
     AVFrame* frame{nullptr};
     Adjustment adjustment{Adjustment::none};
@@ -117,7 +119,7 @@ class Pipeline {
   [[nodiscard]] const Options& options() const noexcept { return opt_; }
 
   // Seeks and decoded frames attributable to the request that just returned: cur_ is reset at the
-  // top of image_at() and nowhere else. Both counters are maintained for learn_costs() and
+  // top of image_at() and nowhere else. Both counters are maintained for SeekCostModel and
   // forward_is_cheaper(), so reading them adds no work to the decode path and a build that never
   // calls these pays nothing. The benchmark harness (tests/bench) uses them to check that a
   // restructure changes neither count -- which seeks happen is the behaviour, the milliseconds are
@@ -484,10 +486,15 @@ class Pipeline {
     auto lpkt = make_packet();
     if (!lpkt) return std::unexpected(lpkt.error());
     land_pkt_ = std::move(*lpkt);
-    for (FramePtr* f : {&recv_, &held_, &pending_, &corrupt_last_}) {
+    {
       auto fr2 = make_frame();
       if (!fr2) return std::unexpected(fr2.error());
-      *f = std::move(*fr2);
+      recv_ = std::move(*fr2);
+    }
+    for (FrameSlot* slot : {&held_, &pending_, &corrupt_last_}) {
+      auto fr2 = make_frame();
+      if (!fr2) return std::unexpected(fr2.error());
+      slot->reset(std::move(*fr2));
     }
     const DisplayTransform applied =
         opt_.apply_preferred_track_transform ? stream_.transform : DisplayTransform{};
@@ -594,7 +601,7 @@ class Pipeline {
       cc->thread_count =
           0;  // libavcodec decides (one frame thread per hardware thread, capped at 16)
     }
-    holes_.clear();
+    frontier.skipped.clear();
     // Deliberately no `skip_frame = AVDISCARD_NONKEY` for nearest-keyframe mode: skipped frames
     // do not advance the reorder buffer, so a keyframe only leaves the decoder when the *next*
     // keyframe arrives, which makes a long GOP dramatically slower rather than faster.
@@ -872,25 +879,14 @@ class Pipeline {
 
   void reset_position() noexcept {
     av_frame_unref(recv_.get());
-    av_frame_unref(held_.get());
-    av_frame_unref(pending_.get());
-    av_frame_unref(corrupt_last_.get());
-    held_valid_ = pending_valid_ = corrupt_valid_ = false;
-    held_concealed_ = pending_concealed_ = false;
-    tainted_ = false;
-    draining_ = eof_ = drained_ = false;
+    held_.clear();
+    pending_.clear();
+    corrupt_last_.clear();
+    frontier.reset();  // including the recorded holes: nothing before a reposition can matter
     landing_known_ = false;
-    last_received_ts_ = k::no_pts;
-    last_fed_dts_ = last_fed_pts_ = k::no_pts;
-    last_key_ts_ = k::no_pts;
-    last_end_ = std::numeric_limits<std::int64_t>::min();
-    received_since_seek_ = 0;
-    synth_ts_ = k::no_pts;
     demux_errors_ = decode_errors_ = 0;
     probe_frame_ = nullptr;
     contig_key_ = no_entry;
-    // Nothing survives a reposition, so no gap recorded before it can matter.
-    holes_.clear();
     clear_gop_buffer();
     if (pkt_pending_ && pkt_) av_packet_unref(pkt_.get());
     pkt_pending_ = false;
@@ -911,7 +907,7 @@ class Pipeline {
     positioned_ = true;
     landed_at_start_ = at_start;
     seek_target_ = target;
-    synth_ts_ = target;
+    frontier.synthTs = target;
   }
 
   /// Seeks towards `target`. Where the seek actually landed is established by read_landing().
@@ -1040,7 +1036,7 @@ class Pipeline {
     if (!fmt_ || fmt_->pb == nullptr) return true;
     if (fmt_->pb->error != k::exit_requested && !(fired && fmt_->pb->eof_reached != 0)) return true;
     const bool cleared = tryResetIoState(*fmt_->pb);
-    const std::int64_t last = last_received_ts_;
+    const std::int64_t last = frontier.lastReceivedTs;
     avformat_flush(fmt_.get());
     if (codec_) avcodec_flush_buffers(codec_.get());
     reset_position();
@@ -1054,7 +1050,7 @@ class Pipeline {
       // Best effort on a non-rewindable input: the demuxer is somewhere at or after the last frame.
       positioned_ = true;
       landed_at_start_ = false;
-      last_received_ts_ = last;
+      frontier.lastReceivedTs = last;
     }
     return true;
   }
@@ -1113,11 +1109,13 @@ class Pipeline {
     // Continuing forward answers from frames the decoder has yet to produce, so it is only sound
     // while every frame between the decoder's frontier and P will actually come out: a gap there
     // (a non-reference frame skipped for an abandoned request) would be the frame on screen.
-    const bool forward_ok = positioned_ && !drained_ && !eof_ && last_received_ts_ != k::no_pts &&
-                            P >= last_received_ts_ && !hole_in(last_received_ts_, P);
+    const bool forward_ok = positioned_ && !frontier.drained && !frontier.eof &&
+                            frontier.lastReceivedTs != k::no_pts && P >= frontier.lastReceivedTs &&
+                            !frontier.skipped.containsIn(frontier.lastReceivedTs, P);
     if (!stream_.seekable) {
       if (forward_ok) return {};
-      if (positioned_ && !drained_ && !eof_ && last_received_ts_ == k::no_pts && landed_at_start_)
+      if (positioned_ && !frontier.drained && !frontier.eof &&
+          frontier.lastReceivedTs == k::no_pts && landed_at_start_)
         return {};
       if (!stream_.io_seekable) {
         return fail(
@@ -1128,8 +1126,9 @@ class Pipeline {
     }
     if (!keyframe_mode) {
       if (forward_ok && forward_is_cheaper(P)) return {};
-      if (positioned_ && !drained_ && !eof_ && last_received_ts_ == k::no_pts &&
-          seek_target_ <= P && P - seek_target_ <= forward_scan_limit()) {
+      if (positioned_ && !frontier.drained && !frontier.eof &&
+          frontier.lastReceivedTs == k::no_pts && seek_target_ <= P &&
+          P - seek_target_ <= forward_scan_limit()) {
         return {};  // freshly positioned just before the target; the landing is verified in
                     // select()
       }
@@ -1282,7 +1281,7 @@ class Pipeline {
       }
     } else if (const KeyEntry* e = covering_key(target); e != nullptr) {
       key_ts = e->dts != k::no_pts ? e->dts : e->pts;
-      fed_ts = e->dts != k::no_pts ? last_fed_dts_ : last_fed_pts_;
+      fed_ts = e->dts != k::no_pts ? frontier.lastFedDts : frontier.lastFedPts;
       covered = true;
     }
     if (covered && key_ts != k::no_pts && fed_ts != k::no_pts) {
@@ -1290,18 +1289,18 @@ class Pipeline {
       if (key_ts <= fed_ts + std::max<std::int64_t>(stream_.frame_duration_hint, 0)) return true;
       // A keyframe lies ahead: forward wins while the frames up to it cost less than a seek (a
       // real trade on hardware decoders and tiny frames).
-      if (frame_cost_ms_ > 0 && stream_.frame_duration_hint > 0) {
+      if (costs.getFrameCostMs() > 0 && stream_.frame_duration_hint > 0) {
         const double frames_to_key =
             static_cast<double>(key_ts - fed_ts) / static_cast<double>(stream_.frame_duration_hint);
-        return frames_to_key * frame_cost_ms_ < seek_cost_ms_;
+        return frames_to_key * costs.getFrameCostMs() < costs.getSeekCostMs();
       }
       return false;
     }
     if (stream_.index_trusted)
-      return target - last_received_ts_ <=
+      return target - frontier.lastReceivedTs <=
              frames_ticks(
                  4);  // the index does not cover P (unread fragment): seeks are exact there
-    return target - last_received_ts_ <= forward_scan_limit();
+    return target - frontier.lastReceivedTs <= forward_scan_limit();
   }
 
   [[nodiscard]] std::size_t key_lower_bound(std::int64_t pts) const noexcept {
@@ -1384,35 +1383,29 @@ class Pipeline {
   }
   /// The last fed packet's timestamp in the container index's domain.
   [[nodiscard]] std::int64_t last_fed_index_ts() const noexcept {
-    return keys_have_dts_ ? last_fed_dts_ : last_fed_pts_;
+    return keys_have_dts_ ? frontier.lastFedDts : frontier.lastFedPts;
   }
 
   [[nodiscard]] std::int64_t frame_ts(const AVFrame& f) const noexcept {
     if (f.best_effort_timestamp != k::no_pts) return f.best_effort_timestamp;
     if (f.pts != k::no_pts) return f.pts;
     if (f.pkt_dts != k::no_pts) return f.pkt_dts;
-    return synth_ts_ != k::no_pts ? synth_ts_ : stream_.start_pts;
+    return frontier.synthTs != k::no_pts ? frontier.synthTs : stream_.start_pts;
   }
 
   [[nodiscard]] std::int64_t frame_duration(const AVFrame& f) const noexcept {
     return f.duration > 0 ? f.duration : stream_.frame_duration_hint;
   }
 
+  // The received frame becomes the answer. The look-ahead slot is emptied with it: no frame past
+  // the new held one has been seen yet, and a stale one there would claim it covers the request.
   void hold_received(bool concealed) noexcept {
-    av_frame_unref(held_.get());
-    av_frame_move_ref(held_.get(), recv_.get());
-    held_valid_ = true;
-    held_concealed_ = concealed;
-    av_frame_unref(pending_.get());
-    pending_valid_ = false;
+    held_.adopt(*recv_, concealed);
+    pending_.clear();
   }
 
-  void pend_received(bool concealed) noexcept {
-    av_frame_unref(pending_.get());
-    av_frame_move_ref(pending_.get(), recv_.get());
-    pending_valid_ = true;
-    pending_concealed_ = concealed;
-  }
+  // One frame of look-ahead past the held frame -- what proves the held frame covers the request.
+  void pend_received(bool concealed) noexcept { pending_.adopt(*recv_, concealed); }
 
   /// Pulls one frame. Returns 0 (frame in recv_), k::eof, k::eagain (needs a packet) or an error.
   [[nodiscard]] int receive_one() noexcept {
@@ -1421,7 +1414,7 @@ class Pipeline {
     if (r == 0) {
       ++cur_.frames_decoded;
     }
-    if (r == k::eagain && draining_) return k::eof;
+    if (r == k::eagain && frontier.draining) return k::eof;
     return r;
   }
 
@@ -1451,9 +1444,10 @@ class Pipeline {
       return s;
     }
     if (s == 0) {
-      if (fed_dts != k::no_pts) last_fed_dts_ = fed_dts;
+      if (fed_dts != k::no_pts) frontier.lastFedDts = fed_dts;
       if (fed_pts != k::no_pts)
-        last_fed_pts_ = last_fed_pts_ == k::no_pts ? fed_pts : std::max(last_fed_pts_, fed_pts);
+        frontier.lastFedPts =
+            frontier.lastFedPts == k::no_pts ? fed_pts : std::max(frontier.lastFedPts, fed_pts);
     }
     av_packet_unref(pkt_.get());
     pkt_pending_ = false;
@@ -1479,7 +1473,7 @@ class Pipeline {
       if (r == k::exit_requested) return r;
       if (r == k::eof || (r < 0 && ++demux_errors_ > max_consecutive_errors)) return k::eof;
       if (r < 0) {
-        tainted_ = true;
+        frontier.tainted = true;
         continue;  // transient demux error: skip and keep reading
       }
       demux_errors_ = 0;
@@ -1716,7 +1710,8 @@ class Pipeline {
 
   /// Keyframe mode after positioning: feed the pending keyframe packet and drain, so the decoder
   /// emits that one frame at once instead of after a pipeline's worth of packets (frame threads
-  /// hold ~thread_count packets). The decoder must be flushed before it is fed again (`drained_`).
+  /// hold ~thread_count packets). The decoder must be flushed before it is fed again
+  /// (`frontier.drained`).
   [[nodiscard]] std::expected<void, Error> arm_keyframe_decode(const CancelToken& token) {
     if (!pkt_pending_) {
       // Positioned but not read yet: fetch the keyframe packet.
@@ -1732,15 +1727,15 @@ class Pipeline {
     if (s < 0 && s != k::eagain)
       return fail(ErrorCode::decode_failed, s, "avcodec_send_packet (keyframe)");
     (void)avcodec_send_packet(codec_.get(), nullptr);
-    draining_ = true;
-    drained_ = true;
+    frontier.draining = true;
+    frontier.drained = true;
     landing_known_ = true;
     return {};
   }
 
   /// Reads the next packet of our stream and feeds it. Returns 0, k::eof (drain started),
   /// k::exit_requested (interrupted) or a decoder error.
-  /// Not noexcept: note_hole() below it allocates.
+  /// Not noexcept: the skipped-frame record below it allocates.
   [[nodiscard]] int feed_one(const CancelToken& token) {
     if (pkt_pending_) {
       if ((pkt_->flags & AV_PKT_FLAG_KEY) != 0) awaiting_key_ = false;
@@ -1755,15 +1750,15 @@ class Pipeline {
       if (s == 0) return 0;
       if (s != k::invalid_data) return s;
       ++total_decode_errors_;
-      tainted_ = true;
+      frontier.tainted = true;
     }
-    if (drained_)
+    if (frontier.drained)
       return k::eof;  // the decoder was drained for a keyframe-only decode; a seek resets it
     for (;;) {
       const int r = read_video_packet(token);
       if (r == k::exit_requested) return r;
       if (r == k::eof) {
-        draining_ = true;
+        frontier.draining = true;
         (void)avcodec_send_packet(codec_.get(), nullptr);
         return k::eof;
       }
@@ -1779,7 +1774,7 @@ class Pipeline {
       if (s == 0 || s == k::eagain) return 0;
       if (s == k::invalid_data) {
         ++total_decode_errors_;
-        tainted_ = true;
+        frontier.tainted = true;
         if (++decode_errors_ > max_consecutive_errors) return s;
         continue;
       }
@@ -1799,11 +1794,11 @@ class Pipeline {
     const bool key = (pkt_->flags & AV_PKT_FLAG_KEY) != 0;
     AVDiscard skip = AVDISCARD_DEFAULT;
     if (skip_before_ts_ != k::no_pts && key_flags_reliable_ && !key && pkt_->pts != k::no_pts &&
-        last_fed_pts_ != k::no_pts) {
+        frontier.lastFedPts != k::no_pts) {
       const std::int64_t pts = pkt_->pts;
-      if (pts < last_fed_pts_ && last_fed_pts_ <= skip_before_ts_) {
+      if (pts < frontier.lastFedPts && frontier.lastFedPts <= skip_before_ts_) {
         skip = AVDISCARD_NONREF;
-        note_hole(pts);  // if the decoder drops it, nothing may decode across it
+        frontier.skipped.record(pts);  // if the decoder drops it, nothing may decode across it
       }
     }
     if (codec_->skip_frame != skip) codec_->skip_frame = skip;
@@ -1824,69 +1819,70 @@ class Pipeline {
       const int r = receive_one();
       if (r == 0) {
         decode_errors_ = 0;
-        if (!first_frame_at_) first_frame_at_ = std::chrono::steady_clock::now();
+        costs.noteFirstFrame();
         if (hw_active_) ++hw_frames_seen_;
         if (stream_.synthesize_timestamps) {
-          const std::int64_t stamped = synth_ts_ != k::no_pts ? synth_ts_ : stream_.start_pts;
+          const std::int64_t stamped =
+              frontier.synthTs != k::no_pts ? frontier.synthTs : stream_.start_pts;
           recv_->pts = recv_->best_effort_timestamp = stamped;
           recv_->duration = stream_.frame_duration_hint;
         }
         const std::int64_t t = frame_ts(*recv_);
-        synth_ts_ = t + frame_duration(*recv_);
-        last_received_ts_ = t;
-        ++received_since_seek_;
+        frontier.synthTs = t + frame_duration(*recv_);
+        frontier.lastReceivedTs = t;
+        ++frontier.receivedSinceSeek;
         const bool key = (recv_->flags & AV_FRAME_FLAG_KEY) != 0;
         // GOP length estimate (a lower bound, exact at the next keyframe): feeds the back-off step
         // and the forward-scan limit.
-        if (last_key_ts_ != k::no_pts && t > last_key_ts_)
-          gop_hint_ = std::max(gop_hint_, t - last_key_ts_);
-        if (key) last_key_ts_ = t;
+        if (frontier.lastKeyTs != k::no_pts && t > frontier.lastKeyTs)
+          gop_hint_ = std::max(gop_hint_, t - frontier.lastKeyTs);
+        if (key) frontier.lastKeyTs = t;
         if ((recv_->flags & AV_FRAME_FLAG_CORRUPT) != 0) {
-          note_hole(t);  // not produced: nothing may decode across it
-          av_frame_unref(corrupt_last_.get());
-          av_frame_move_ref(corrupt_last_.get(), recv_.get());
-          corrupt_valid_ = true;
+          frontier.skipped.record(t);  // not produced: nothing may decode across it
+          // Concealed by construction: this is the frame the decoder itself flagged, stashed only
+          // as a fallback for a stream that never produces a better one (finish_at_eof).
+          corrupt_last_.adopt(*recv_, /*wasConcealed=*/true);
           continue;
         }
         // Corrupt: the decoder reported concealment, or a decode error occurred since the last
         // keyframe (the reference chain is suspect).
-        if (key) tainted_ = false;
-        const bool concealed = recv_->decode_error_flags != 0 || tainted_;
-        last_end_ = std::max(last_end_, t + frame_duration(*recv_));
-        clear_hole(t);  // whatever was skipped here has now been produced
+        if (key) frontier.tainted = false;
+        const bool concealed = recv_->decode_error_flags != 0 || frontier.tainted;
+        frontier.lastEnd = std::max(frontier.lastEnd, t + frame_duration(*recv_));
+        frontier.skipped.clearAt(t);  // whatever was skipped here has now been produced
         if (keyframe_only_) {
           // "The keyframe at or before P": the fed keyframe after a packet-level landing
           // (landing_known_), or the first keyframe out after a seek aimed at P itself. After a
           // back-off (seek_target_ < P) that guarantee is gone: keep decoding, remembering the last
           // keyframe <= P, until a frame past P shows up.
           if (t <= P) {
-            if (key || !held_valid_)
+            if (key || !held_.isValid())
               hold_received(concealed);  // a non-key frame only as a fallback
-            if (key &&
-                (landing_known_ || t == P || (received_since_seek_ == 1 && seek_target_ == P))) {
-              return Selected{held_.get(), Adjustment::none, held_concealed_};
+            if (key && (landing_known_ || t == P ||
+                        (frontier.receivedSinceSeek == 1 && seek_target_ == P))) {
+              return Selected{held_.getFrame(), Adjustment::none, held_.isConcealed()};
             }
             continue;
           }
-          if (held_valid_) {
+          if (held_.isValid()) {
             pend_received(concealed);
-            return Selected{held_.get(), Adjustment::none, held_concealed_};
+            return Selected{held_.getFrame(), Adjustment::none, held_.isConcealed()};
           }
         } else {
           if (t < P) {
             hold_received(concealed);
             if (t >= lo)
-              return Selected{held_.get(), Adjustment::none,
-                              held_concealed_};  // early accept within tolerance
+              return Selected{held_.getFrame(), Adjustment::none,
+                              held_.isConcealed()};  // early accept within tolerance
             continue;
           }
           if (t == P) {
             hold_received(concealed);
-            return Selected{held_.get(), Adjustment::none, held_concealed_};
+            return Selected{held_.getFrame(), Adjustment::none, held_.isConcealed()};
           }
-          if (held_valid_) {
+          if (held_.isValid()) {
             pend_received(concealed);
-            return Selected{held_.get(), Adjustment::none, held_concealed_};
+            return Selected{held_.getFrame(), Adjustment::none, held_.isConcealed()};
           }
         }
         // Overshoot: the first frame out is already past P. Either P precedes the first frame of
@@ -1895,7 +1891,7 @@ class Pipeline {
         // frame actually on screen at P exists until proven otherwise.
         const bool at_start = landed_at_start_ || !stream_.seekable ||
                               (first_frame_ts_ != k::no_pts && t <= first_frame_ts_);
-        const bool landing = received_since_seek_ == 1;
+        const bool landing = frontier.receivedSinceSeek == 1;
         const std::int64_t observed_key = key ? t : k::no_pts;
         if (landing && !at_start) {
           if (auto s = back_off(P, observed_key); !s) return std::unexpected(std::move(s.error()));
@@ -1903,11 +1899,11 @@ class Pipeline {
         }
         if (t <= hi) {
           hold_received(concealed);
-          return Selected{held_.get(), Adjustment::none, held_concealed_};
+          return Selected{held_.getFrame(), Adjustment::none, held_.isConcealed()};
         }
         if (at_start) {
           hold_received(concealed);
-          return Selected{held_.get(), Adjustment::clamped_to_first, held_concealed_};
+          return Selected{held_.getFrame(), Adjustment::clamped_to_first, held_.isConcealed()};
         }
         if (auto s = back_off(P, observed_key); !s) return std::unexpected(std::move(s.error()));
         continue;
@@ -1915,8 +1911,8 @@ class Pipeline {
       if (r == k::eof) {
         // Nothing decodable between the landing and the end of the stream. Back off unless the
         // start seek has already been done, in which case the stream really has no frame for P.
-        if (!held_valid_ && !corrupt_valid_ && stream_.seekable && positioned_ &&
-            !landed_at_start_ && !drained_) {
+        if (!held_.isValid() && !corrupt_last_.isValid() && stream_.seekable && positioned_ &&
+            !landed_at_start_ && !frontier.drained) {
           if (auto s = back_off(P, k::no_pts); !s) return std::unexpected(std::move(s.error()));
           continue;
         }
@@ -1925,16 +1921,17 @@ class Pipeline {
         // reported the end, which is what libavio's sticky eof_reached does after a cancellation
         // (a seek does not clear it). Clear it and re-position once before concluding the stream
         // ended — `landed_at_start_` above would otherwise accept that first read as proof.
-        if (!held_valid_ && !corrupt_valid_ && stream_.seekable && !drained_ &&
-            received_since_seek_ == 0 && !eof_retried_) {
+        if (!held_.isValid() && !corrupt_last_.isValid() && stream_.seekable && !frontier.drained &&
+            frontier.receivedSinceSeek == 0 && !eof_retried_) {
           eof_retried_ = true;
           if (auto s = retry_after_empty_eof(P, token); !s)
             return std::unexpected(std::move(s.error()));
           continue;
         }
-        eof_ = true;
-        if (last_end_ != std::numeric_limits<std::int64_t>::min()) {
-          tail_end_ = tail_end_ == k::no_pts ? last_end_ : std::max(tail_end_, last_end_);
+        frontier.eof = true;
+        if (frontier.lastEnd != std::numeric_limits<std::int64_t>::min()) {
+          tail_end_ =
+              tail_end_ == k::no_pts ? frontier.lastEnd : std::max(tail_end_, frontier.lastEnd);
         }
         return finish_at_eof(P);
       }
@@ -1953,7 +1950,7 @@ class Pipeline {
         return fail(ErrorCode::decode_failed, f, "avcodec_send_packet");
       }
       ++total_decode_errors_;
-      tainted_ = true;
+      frontier.tainted = true;
       if (hardware_fault(r)) {
         hw_fault_ = true;
         return fail(ErrorCode::decode_failed, r, "avcodec_receive_frame (hardware)");
@@ -1966,14 +1963,15 @@ class Pipeline {
   }
 
   [[nodiscard]] std::expected<Selected, Error> finish_at_eof(std::int64_t P) {
-    const auto finish = [&](FramePtr& f, bool corrupt) -> std::expected<Selected, Error> {
+    const auto finish = [&](AVFrame* f, bool corrupt) -> std::expected<Selected, Error> {
       const std::int64_t t = frame_ts(*f);
       // In keyframe mode the stream extends past the held keyframe to the last frame decoded after
       // it.
-      const std::int64_t end = std::max(t + frame_duration(*f), keyframe_only_ ? last_end_ : t);
-      if (P < end) return Selected{f.get(), Adjustment::none, corrupt};
+      const std::int64_t end =
+          std::max(t + frame_duration(*f), keyframe_only_ ? frontier.lastEnd : t);
+      if (P < end) return Selected{f, Adjustment::none, corrupt};
       if (opt_.out_of_range == OutOfRangePolicy::clamp_to_last_frame)
-        return Selected{f.get(), Adjustment::clamped_to_last, corrupt};
+        return Selected{f, Adjustment::clamped_to_last, corrupt};
       return fail(
           ErrorCode::time_out_of_range,
           "requested time is past the last frame (" +
@@ -1981,18 +1979,14 @@ class Pipeline {
                                              from_av(stream_.time_base))) +
               ")");
     };
-    if (held_valid_) return finish(held_, held_concealed_);
-    if (corrupt_valid_) {
-      av_frame_unref(held_.get());
-      av_frame_move_ref(held_.get(), corrupt_last_.get());
-      held_valid_ = true;
-      held_concealed_ = true;
-      corrupt_valid_ = false;
+    if (held_.isValid()) return finish(held_.getFrame(), held_.isConcealed());
+    if (corrupt_last_.isValid()) {
+      held_.adopt(corrupt_last_);  // carries the concealed flag the stash was adopted with
       // Nearest-keyframe mode asks for "the keyframe at or before P", and a stashed frame at or
       // before P answers that: its display interval is not the question, as it is in exact mode.
-      if (keyframe_only_ && P >= frame_ts(*held_))
-        return Selected{held_.get(), Adjustment::none, true};
-      return finish(held_, true);
+      if (keyframe_only_ && P >= frame_ts(*held_.getFrame()))
+        return Selected{held_.getFrame(), Adjustment::none, true};
+      return finish(held_.getFrame(), true);
     }
     if (total_decode_errors_ > 0) {
       return fail(
@@ -2053,8 +2047,8 @@ class Pipeline {
   /// "the stream has no frame past this one" from it strands the generator, because the
   /// end-of-stream shortcut then answers every later request without ever repositioning.
   [[nodiscard]] bool held_is_tail() const noexcept {
-    if (!held_valid_) return false;
-    return frame_ts(*held_) + frame_duration(*held_) >= last_end_;
+    if (!held_.isValid()) return false;
+    return frame_ts(*held_.getFrame()) + frame_duration(*held_.getFrame()) >= frontier.lastEnd;
   }
 
   /// Positions and selects (the caller converts).
@@ -2071,22 +2065,22 @@ class Pipeline {
       hi = P;
     }
     // Fast path: the frame covering P is already held.
-    if (held_valid_) {
-      const std::int64_t h = frame_ts(*held_);
+    if (held_.isValid()) {
+      const std::int64_t h = frame_ts(*held_.getFrame());
       // A skipped frame between the held frame and P is the one on screen: the held frame does not
       // cover P after all, whatever the look-ahead or the end of stream say.
-      if (h <= P && !hole_in(h, P)) {
+      if (h <= P && !frontier.skipped.containsIn(h, P)) {
         if (keyframe_mode) {
           // The held frame is the keyframe covering P (the index says no keyframe lies in (h, P]).
-          if ((held_->flags & AV_FRAME_FLAG_KEY) != 0 && key_covers(h, P)) {
-            return verify_keyframe_tail(Selected{held_.get(), clamped_by_bounds, held_concealed_},
-                                        P, token);
+          if ((held_.getFrame()->flags & AV_FRAME_FLAG_KEY) != 0 && key_covers(h, P)) {
+            return verify_keyframe_tail(
+                Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()}, P, token);
           }
         } else {
-          if (pending_valid_ && P < frame_ts(*pending_)) {
-            return Selected{held_.get(), clamped_by_bounds, held_concealed_};
+          if (pending_.isValid() && P < frame_ts(*pending_.getFrame())) {
+            return Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()};
           }
-          if (eof_ && !pending_valid_ && held_is_tail()) {
+          if (frontier.eof && !pending_.isValid() && held_is_tail()) {
             auto s = finish_at_eof(P);
             if (!s) return std::unexpected(std::move(s.error()));
             if (s->adjustment == Adjustment::none) s->adjustment = clamped_by_bounds;
@@ -2119,26 +2113,24 @@ class Pipeline {
       } else if (auto r = arm_keyframe_decode(token); !r) {
         return std::unexpected(std::move(r.error()));
       }
-    } else if (pending_valid_ && !drained_ && P >= frame_ts(*pending_) &&
-               !hole_in(frame_ts(*pending_), P) && forward_is_cheaper(P)) {
-      av_frame_unref(held_.get());
-      av_frame_move_ref(held_.get(), pending_.get());
-      held_valid_ = true;
-      held_concealed_ = pending_concealed_;
-      pending_valid_ = false;
+    } else if (pending_.isValid() && !frontier.drained && P >= frame_ts(*pending_.getFrame()) &&
+               !frontier.skipped.containsIn(frame_ts(*pending_.getFrame()), P) &&
+               forward_is_cheaper(P)) {
+      held_.adopt(pending_);
       backoffs_ = 0;
       backoff_step_ = 0;
-    } else if (!(held_valid_ && !pending_valid_ && !eof_ && !drained_ && frame_ts(*held_) <= P &&
-                 !hole_in(frame_ts(*held_), P) && forward_is_cheaper(P))) {
+    } else if (!(held_.isValid() && !pending_.isValid() && !frontier.eof && !frontier.drained &&
+                 frame_ts(*held_.getFrame()) <= P &&
+                 !frontier.skipped.containsIn(frame_ts(*held_.getFrame()), P) &&
+                 forward_is_cheaper(P))) {
       if (auto r = position_for(P, false, token); !r) return std::unexpected(std::move(r.error()));
     } else {
       backoffs_ = 0;
       backoff_step_ = 0;
     }
-    const auto t0 = std::chrono::steady_clock::now();
+    costs.beginRequest();
     const int frames_before = cur_.frames_decoded;
     const bool seeked = cur_.seeks > 0;
-    first_frame_at_.reset();
     auto sel = select(P, lo, hi, token);
     if (!sel) {
       // A request abandoned before reaching its target fed packets under *its* skip window, and
@@ -2149,69 +2141,10 @@ class Pipeline {
       if (skip_before_ts_ != k::no_pts && stream_.seekable) positioned_ = false;
       return std::unexpected(std::move(sel.error()));
     }
-    learn_costs(t0, frames_before, seeked);
+    costs.learn(cur_.frames_decoded - frames_before, seeked);
     if (sel->adjustment == Adjustment::none) sel->adjustment = clamped_by_bounds;
     if (keyframe_mode) return verify_keyframe_tail(*sel, P, token);
     return *sel;
-  }
-
-  // Holes: presentation times of frames never produced (AVDISCARD_NONREF, or flagged corrupt).
-  // A hole between the decoder's frontier and the request means the frame on screen was never
-  // decoded, so nothing may be concluded across one.
-  static constexpr std::size_t max_holes = 1u << 14;
-
-  /// Records a frame that may never be produced. The held/look-ahead frames and the
-  /// forward-continuation decision consult it, and a request abandoned before its target can leave
-  /// a gap ahead of the decoder's frontier (see extract()).
-  void note_hole(std::int64_t pts) {
-    if (pts == k::no_pts) return;
-    const auto it = std::lower_bound(holes_.begin(), holes_.end(), pts);
-    if (it != holes_.end() && *it == pts) return;
-    if (holes_.size() >= max_holes) {
-      holes_.clear();  // pathological: forget everything rather than grow without bound
-      return;
-    }
-    holes_.insert(it, pts);
-  }
-  /// The frame was decoded after all: it is no longer a gap.
-  void clear_hole(std::int64_t pts) noexcept {
-    if (holes_.empty() || pts == k::no_pts) return;
-    const auto it = std::lower_bound(holes_.begin(), holes_.end(), pts);
-    if (it != holes_.end() && *it == pts) holes_.erase(it);
-  }
-  /// True when a skipped/undecoded frame lies in (after, up_to].
-  [[nodiscard]] bool hole_in(std::int64_t after, std::int64_t up_to) const noexcept {
-    if (holes_.empty() || up_to <= after) return false;
-    const auto it = std::upper_bound(holes_.begin(), holes_.end(), after);
-    return it != holes_.end() && *it <= up_to;
-  }
-  /// Exponential averages of what a seek (positioning + the first frame out of a flushed decoder)
-  /// and one further decoded frame cost. A seek request is split at `first_frame_at_`: the part
-  /// before it is the seek sample, the frames after it are frame samples.
-  void learn_costs(std::chrono::steady_clock::time_point t0, int frames_before,
-                   bool seeked) noexcept {
-    const auto now = std::chrono::steady_clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(now - t0).count();
-    const int frames = cur_.frames_decoded - frames_before;
-    const auto ema = [](double& acc, double sample) {
-      acc = acc > 0 ? acc * 0.7 + sample * 0.3 : sample;
-    };
-    if (frames <= 0) return;
-    if (!seeked) {
-      ema(frame_cost_ms_, ms / frames);
-      return;
-    }
-    if (first_frame_at_ && *first_frame_at_ >= t0) {
-      ema(seek_cost_ms_, std::chrono::duration<double, std::milli>(*first_frame_at_ - t0).count());
-      if (frames > 1)
-        ema(frame_cost_ms_,
-            std::chrono::duration<double, std::milli>(now - *first_frame_at_).count() /
-                (frames - 1));
-    } else if (frame_cost_ms_ > 0) {
-      ema(seek_cost_ms_, std::max(0.0, ms - (frames - 1) * frame_cost_ms_));
-    } else {
-      ema(seek_cost_ms_, ms);
-    }
   }
 
   [[nodiscard]] std::expected<Image, Error> convert(Selected sel) {
@@ -2267,10 +2200,10 @@ class Pipeline {
 
   PacketPtr pkt_;
   bool pkt_pending_{false};  ///< pkt_ holds a packet the decoder refused with EAGAIN
-  FramePtr recv_, held_, pending_, corrupt_last_;
-  bool held_valid_{false}, pending_valid_{false}, corrupt_valid_{false};
-  bool held_concealed_{false}, pending_concealed_{false};
-  bool tainted_{false};  ///< a decode error occurred since the last keyframe
+  FramePtr recv_;  ///< scratch: avcodec_receive_frame writes here, then a slot adopts it
+  FrameSlot held_, pending_, corrupt_last_;
+  DecodeFrontier frontier;  ///< where the decoder is; every reposition resets it
+  SeekCostModel costs;      ///< what a seek and a frame cost here; drives forward_is_cheaper()
   const AVFrame* probe_frame_{nullptr};
   bool positioned_{false};
   bool landed_at_start_{false};  ///< the last positioning was the explicit start seek or a re-open
@@ -2278,39 +2211,23 @@ class Pipeline {
   bool first_packet_seen_{false};
   bool key_flags_reliable_{
       false};  ///< the demuxer flags keyframe packets (first packet was flagged)
-  bool draining_{false};
-  bool eof_{false};
   std::int64_t seek_target_{0};
-  std::int64_t last_received_ts_{k::no_pts};
-  std::int64_t last_key_ts_{k::no_pts};
-  int received_since_seek_{0};  ///< frames out of the decoder since the last positioning
   /// One re-position per request after an end of stream that decoded nothing (see select()).
   bool eof_retried_{false};
   /// Set by interrupt_callback() when it aborts libav I/O, consumed by recover_after_interrupt().
   bool interrupt_fired_{false};
-  std::int64_t last_end_{
-      std::numeric_limits<std::int64_t>::min()};  ///< furthest frame end seen since positioning
   bool keyframe_only_{false};  ///< the current request is in nearest-keyframe mode
   std::int64_t gop_hint_{0};   ///< largest keyframe spacing observed, in stream ticks
-  std::int64_t synth_ts_{k::no_pts};
   std::int64_t first_frame_ts_{k::no_pts};
   std::int64_t backoff_step_{0};
   int backoffs_{0};
-  bool drained_{false};     ///< the decoder was drained for a keyframe-only decode; must be flushed
-                            ///< (seek) before more input
-  bool landing_known_{false};             ///< keyframe mode: the fed keyframe packet is the answer
-  std::int64_t last_fed_dts_{k::no_pts};  ///< dts of the last packet sent to the decoder
-  std::int64_t last_fed_pts_{k::no_pts};  ///< largest pts sent to the decoder since positioning
-  bool keys_have_dts_{false};             ///< keyframe packets carry a dts (mov); Matroska's do not
+  bool landing_known_{false};  ///< keyframe mode: the fed keyframe packet is the answer
+  bool keys_have_dts_{false};  ///< keyframe packets carry a dts (mov); Matroska's do not
   std::int64_t reorder_ticks_{
       0};  ///< a keyframe's pts - dts (the B-frame reorder delay), smallest seen
   bool reorder_known_{false};
   std::int64_t seek_bias_{0};  ///< subtracted from seek targets on demuxers that search a DTS index
                                ///< with an unshifted PTS (fragmented MP4)
-  double seek_cost_ms_{0};      ///< learned: positioning + first frame after a flush
-  double frame_cost_ms_{0};     ///< learned: one further decoded frame
-  std::optional<std::chrono::steady_clock::time_point>
-      first_frame_at_;  ///< when the current request's first frame came out
   std::vector<KeyEntry>
       key_index_;  ///< keyframe packets seen (containers without a trusted index), by pts
   std::size_t contig_key_{
@@ -2323,8 +2240,6 @@ class Pipeline {
       k::no_pts};  ///< largest packet presentation time actually read from the source
   std::int64_t tail_end_{k::no_pts};  ///< end of the data once the end of stream has been observed
                                       ///< (k::no_pts = not yet)
-  std::vector<std::int64_t> holes_;  ///< presentation times of frames skipped (NONREF) or dropped
-                                     ///< (corrupt) since the last reposition, sorted
   std::vector<PacketPtr> gop_buffer_;  ///< exact mode: the chosen keyframe's packets scanned past
                                        ///< P, replayed to the decoder
   std::size_t gop_buffer_bytes_{0};
@@ -2339,8 +2254,8 @@ class Pipeline {
       broken_reason_;  ///< why the last re-open failed (the pipeline retries on the next request)
 
   /// What the current request has cost so far, reset at the start of each one. Not observability:
-  /// learn_costs() reads frames_decoded, and forward_is_cheaper() decides seek-versus-decode-forward
-  /// from the exponential averages learn_costs() maintains. Decoding thread only.
+  /// SeekCostModel::learn() reads frames_decoded, and forward_is_cheaper() decides
+  /// seek-versus-decode-forward from the averages it maintains. Decoding thread only.
   struct RequestStats {
     int seeks{0};           ///< avformat_seek_file / av_seek_frame calls made for this request
     int frames_decoded{0};  ///< frames received from the decoder, look-ahead and skipped included
