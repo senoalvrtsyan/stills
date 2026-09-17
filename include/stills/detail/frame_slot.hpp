@@ -11,9 +11,10 @@
 // only by adopting a frame and invalid only by clear(), so the flag and the frame cannot disagree.
 // Before this, the flags were set by hand in five places and agreed only by inspection.
 //
-// Precondition on every member but install(): the slot has been given its AVFrame. open_input()
-// gives all three theirs before anything else can reach them and nothing takes one away, so this
-// is a precondition the asserts name, not a case the members branch on.
+// Precondition on every member but install(): the slot has been given its AVFrame.
+// Pipeline::attach_to_source() gives all three theirs before anything else can reach them and
+// nothing takes one away, so this is a precondition the asserts name, not a case the members
+// branch on.
 //
 // Not thread-safe, and not meant to be: a Pipeline is single-threaded by contract (pipeline.hpp),
 // and a slot is only ever touched by the thread running that pipeline's decode loop.

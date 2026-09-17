@@ -24,7 +24,7 @@
 // the hour; the counts are a property of the code. A restructure that changes which seeks happen is
 // a behaviour change wearing a refactor's clothes, and it shows up here as a changed count long
 // before it shows up as a changed millisecond. Both counters already exist in the shipped library
-// for SeekCostModel and forward_is_cheaper(); this only reads them (Pipeline::getSeekCount).
+// for SeekCostModel and isForwardCheaperThanSeek(); this only reads them (Pipeline::getSeekCount).
 //
 // How to compare two revisions, because the milliseconds do not survive being compared across
 // sittings. These fixtures are small and a request costs tens of microseconds, so this column
@@ -42,7 +42,7 @@
 // no library behaviour, so the two are the same asset to measure.
 //
 // One caveat on those counts, and it is the reason every case is run more than once. The
-// seek-versus-decode-forward decision is not purely structural: forward_is_cheaper() compares
+// seek-versus-decode-forward decision is not purely structural: isForwardCheaperThanSeek() compares
 // `frames_to_key * frameCostMs` against `seekCostMs`, and both are exponential averages of
 // measured wall-clock time. A request sitting near that boundary can go either way on a loaded
 // machine. So each case is run `--reps` times from a fresh pipeline, and a count that is not

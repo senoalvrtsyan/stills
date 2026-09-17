@@ -1,15 +1,15 @@
 #pragma once
-// stills/detail/pipeline.hpp — everything that touches one AVFormatContext/AVCodecContext:
-// opening, stream selection, hardware setup with software fallback, accurate seeking and the
-// decode loop, frame selection, and conversion to the output Image.
+// stills/detail/pipeline.hpp — the decoder and everything built on it: hardware setup with
+// software fallback, accurate seeking, the decode loop, frame selection, and conversion to the
+// output Image.
+//
+// The container and its I/O live in MediaSource (detail/media_source.hpp), which this owns and
+// drives. Anything reaching the AVFormatContext goes through it.
 //
 // A Pipeline is single-threaded by contract: callers serialise access (see worker.hpp).
 
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <expected>
 #include <limits>
 #include <memory>
@@ -27,53 +27,13 @@
 #include "stills/detail/ffmpeg.hpp"
 #include "stills/detail/frame_slot.hpp"
 #include "stills/detail/hw.hpp"
+#include "stills/detail/media_source.hpp"
 #include "stills/detail/seek_cost_model.hpp"
 #include "stills/image.hpp"
 #include "stills/options.hpp"
 #include "stills/time.hpp"
 
 namespace stills::detail {
-
-/// Cooperative cancellation: two optional flags (per-batch and per-generator).
-struct CancelToken {
-  const std::atomic<bool>* batch{nullptr};
-  const std::atomic<bool>* generator{nullptr};
-
-  [[nodiscard]] bool requested() const noexcept {
-    return (batch != nullptr && batch->load(std::memory_order_relaxed)) ||
-           (generator != nullptr && generator->load(std::memory_order_relaxed));
-  }
-};
-
-/// Rotation and mirroring that display the coded picture upright, decoded from a display matrix.
-struct DisplayTransform {
-  int rotation{0};       ///< clockwise degrees, one of 0/90/180/270
-  bool mirrored{false};  ///< horizontal mirror, applied *after* the rotation
-};
-
-/// Decodes a 3x3 display matrix (16.16 fixed point, row-vector convention: display = coded * M).
-/// A negative determinant means the matrix contains a reflection; av_display_rotation_get alone
-/// would misreport a pure horizontal flip as a 180 degree rotation. Splitting M = R * F (rotate,
-/// then mirror horizontally) covers all eight orientations exactly.
-[[nodiscard]] inline DisplayTransform decode_display_matrix(const std::int32_t in[9]) noexcept {
-  std::int32_t m[9];
-  std::memcpy(m, in, sizeof m);
-  DisplayTransform t;
-  const double det = static_cast<double>(m[0]) * static_cast<double>(m[4]) -
-                     static_cast<double>(m[1]) * static_cast<double>(m[3]);
-  if (det < 0) {
-    t.mirrored = true;
-    av_display_matrix_flip(m, 1, 0);  // M * Fh: negates column 0, leaving a pure rotation
-  }
-  // libav reports counter-clockwise degrees; ffmpeg's own autorotate negates it.
-  double theta = -av_display_rotation_get(m);
-  if (std::isnan(theta)) return DisplayTransform{};
-  theta -= 360.0 * std::floor(theta / 360.0 + 0.9 / 360.0);
-  // Only right angles are honoured; anything else (a 45 degree matrix) snaps to the nearest.
-  const int snapped = static_cast<int>(std::lround(theta / 90.0)) * 90;
-  t.rotation = snapped % 360;
-  return t;
-}
 
 class Pipeline {
  public:
@@ -94,17 +54,18 @@ class Pipeline {
   [[nodiscard]] static std::expected<std::unique_ptr<Pipeline>, Error> open(
       std::string source, Options options, const CancelToken* token = nullptr) {
     std::unique_ptr<Pipeline> p{new Pipeline(std::move(source), std::move(options))};
-    p->current_token_ = token;
+    p->source_.setCancelToken(token);
     auto finish = [&](Error e) -> std::expected<std::unique_ptr<Pipeline>, Error> {
-      p->current_token_ = nullptr;
+      p->source_.setCancelToken(nullptr);
       if (token != nullptr && token->requested())
         return fail(ErrorCode::cancelled, "open cancelled");
       return std::unexpected(std::move(e));
     };
-    if (auto r = p->open_input(); !r) return finish(std::move(r.error()));
+    if (auto r = p->source_.open(p->opt_); !r) return finish(std::move(r.error()));
+    if (auto r = p->attach_to_source(); !r) return finish(std::move(r.error()));
     if (auto r = p->setup_decoder(); !r) return finish(std::move(r.error()));
     p->fill_info();
-    p->current_token_ = nullptr;
+    p->source_.setCancelToken(nullptr);
     return p;
   }
 
@@ -120,11 +81,17 @@ class Pipeline {
 
   // Seeks and decoded frames attributable to the request that just returned: cur_ is reset at the
   // top of image_at() and nowhere else. Both counters are maintained for SeekCostModel and
-  // forward_is_cheaper(), so reading them adds no work to the decode path and a build that never
-  // calls these pays nothing. The benchmark harness (tests/bench) uses them to check that a
+  // isForwardCheaperThanSeek(), so reading them adds no work to the decode path and a build that
+  // never calls these pays nothing. The benchmark harness (tests/bench) uses them to check that a
   // restructure changes neither count -- which seeks happen is the behaviour, the milliseconds are
   // only the machine.
-  [[nodiscard]] int getSeekCount() const noexcept { return cur_.seeks; }
+  //
+  // The seeks are a difference rather than a counter of their own: MediaSource counts every seek it
+  // issues, because that is where the calls are made and a count kept anywhere else could drift out
+  // of step with them, and a request is not a scope MediaSource knows about.
+  [[nodiscard]] int getSeekCount() const noexcept {
+    return static_cast<int>(source_.getSeekCallCount() - cur_.seeksAtStart);
+  }
   [[nodiscard]] int getDecodedFrameCount() const noexcept { return cur_.frames_decoded; }
 
   /// Extracts the frame for `requested` (asset-relative). Thread-unsafe by design.
@@ -136,11 +103,11 @@ class Pipeline {
   /// this frame, the only one that can drop the half-updated state: the next request re-positions.
   [[nodiscard]] std::expected<Image, Error> image_at(Time requested, const RequestOptions& ro,
                                                      const CancelToken& token) {
-    cur_ = RequestStats{};
+    cur_ = RequestStats{.seeksAtStart = source_.getSeekCallCount()};
     try {
       return image_at_impl(requested, ro, token);
     } catch (const std::bad_alloc&) {
-      current_token_ = nullptr;
+      source_.setCancelToken(nullptr);
       reset_position();     // frees the frames and the buffers; allocates nothing
       positioned_ = false;  // an unwound request left the demuxer wherever it stopped
       hw_fault_ = false;
@@ -152,7 +119,7 @@ class Pipeline {
  private:
   [[nodiscard]] std::expected<Image, Error> image_at_impl(Time requested, const RequestOptions& ro,
                                                           const CancelToken& token) {
-    current_token_ = &token;
+    source_.setCancelToken(&token);
     // Only a fault raised by *this* request may drive the rebuild below. One left over from a
     // candidate probed at open would otherwise turn the next unrelated failure (a cancellation, a
     // time_out_of_range) into a decoder rebuild and rewrite fallback_reason.
@@ -181,21 +148,21 @@ class Pipeline {
     if (!result && hw_fault_) {
       hw_fault_ = false;
       if (opt_.hardware.policy == HardwarePolicy::require_hardware) {
-        current_token_ = nullptr;
+        source_.setCancelToken(nullptr);
         return std::unexpected(make_error(ErrorCode::hardware_unavailable, 0,
                                           "hardware decoding failed: " + result.error().message));
       }
       if (auto r = rebuild_software("hardware decoder failed during decoding: " +
                                     result.error().message);
           !r) {
-        current_token_ = nullptr;
+        source_.setCancelToken(nullptr);
         return std::unexpected(std::move(r.error()));
       }
       result = attempt();
     }
     if (result && hw_active_)
       hw_retried_ = false;  // a successful hardware request re-arms the retry
-    current_token_ = nullptr;
+    source_.setCancelToken(nullptr);
     // AVERROR_EXIT with a cancelled token is the cancellation; with a live token it is a stale
     // interrupt and stays an I/O failure.
     if (!result && result.error().av_error == k::exit_requested && token.requested()) {
@@ -224,12 +191,12 @@ class Pipeline {
     // nearest tick, so an exact k/fps lands a fraction of a tick below frame k and flooring would
     // return frame k-1.
     const std::int64_t rel =
-        requested.to_timestamp(from_av(stream_.time_base), TimeRounding::nearest);
+        requested.to_timestamp(from_av(stream().time_base), TimeRounding::nearest);
     if (rel == std::numeric_limits<std::int64_t>::max()) {
       return fail(ErrorCode::time_out_of_range, "requested time does not fit the stream time base");
     }
     std::int64_t target = 0;
-    if (__builtin_add_overflow(stream_.start_pts, rel, &target)) {
+    if (__builtin_add_overflow(stream().start_pts, rel, &target)) {
       // A representable Time can still fall outside the stream's timestamp domain once the origin
       // is added (an MPEG-TS starting at 10 s). Report it rather than wrapping.
       return fail(ErrorCode::time_out_of_range, "requested time does not fit the stream time base");
@@ -237,15 +204,16 @@ class Pipeline {
     Adjustment clamped = Adjustment::none;
     // Containers occasionally understate their duration by a frame; give one frame of slack before
     // rejecting up front, and let the decoder (EOF) decide inside that margin.
-    if (stream_.duration_pts &&
-        rel > *stream_.duration_pts + std::max<std::int64_t>(stream_.frame_duration_hint, 0)) {
+    if (stream().duration_pts &&
+        rel > *stream().duration_pts + std::max<std::int64_t>(stream().frame_duration_hint, 0)) {
       if (opt_.out_of_range == OutOfRangePolicy::error) {
         return fail(
             ErrorCode::time_out_of_range,
             to_string(requested) + " is beyond the asset duration " +
-                to_string(Time::from_timestamp(*stream_.duration_pts, from_av(stream_.time_base))));
+                to_string(Time::from_timestamp(*stream().duration_pts,
+                                               from_av(stream().time_base))));
       }
-      target = stream_.start_pts + *stream_.duration_pts;
+      target = stream().start_pts + *stream().duration_pts;
       clamped = Adjustment::clamped_to_last;
     }
 
@@ -257,7 +225,7 @@ class Pipeline {
       }
       std::int64_t ticks = 0;
       if (tol.is_finite() && tol > Time::zero()) {
-        ticks = tol.to_timestamp(from_av(stream_.time_base), TimeRounding::down);
+        ticks = tol.to_timestamp(from_av(stream().time_base), TimeRounding::down);
       }
       // A tolerance that reaches beyond half the timestamp domain is treated as an infinite one.
       // The edge is formed first and compared afterwards: `ticks > target - INT64_MIN / 2` is the
@@ -281,7 +249,7 @@ class Pipeline {
     const std::int64_t lo = window_edge(tolerance.before, true);
     const std::int64_t hi = window_edge(tolerance.after, false);
 
-    if (!fmt_ || !codec_) {
+    if (!source_.isOpen() || !codec_) {
       // A previous re-open failed (or was cancelled): retry rather than staying dead forever.
       if (auto r = reopen(); !r) {
         return fail(ErrorCode::unusable, r.error().av_error,
@@ -290,195 +258,35 @@ class Pipeline {
     }
     if (!recover_after_interrupt()) {
       // The interrupt left libavio's state stuck and this libavformat major is not one
-      // tryResetIoState() can clear (see there): re-open instead of reading through it.
+      // MediaSource::tryResetIoState() can clear: re-open instead of reading through it.
       if (auto r = reopen(); !r) return std::unexpected(std::move(r.error()));
     }
     eof_retried_ = false;  // one re-position per attempt (a hardware fallback retries the request)
     return extract(target, lo, hi, clamped, token);
   }
 
-  struct StreamInfo {
-    int index{-1};
-    AVRational time_base{1, 1};
-    std::int64_t start_pts{0};
-    std::optional<std::int64_t> duration_pts;
-    std::int64_t frame_duration_hint{0};
-    AVRational container_sar{0, 1};  ///< AVStream::sample_aspect_ratio (container level, wins)
-    AVRational codec_sar{0, 1};      ///< AVCodecParameters::sample_aspect_ratio (bitstream level)
-    AVRational avg_frame_rate{0, 1};
-    DisplayTransform transform;
-    bool seekable{true};     ///< avformat_seek_file is usable (timestamps + seekable I/O)
-    bool io_seekable{true};  ///< the source can be rewound (a file, not a pipe)
-    /// The container carries no timestamps (raw elementary streams). libavformat then synthesises
-    /// decode-order counters that disagree with display order under B-frame reordering, so the
-    /// pipeline stamps decoded frames itself: output order x frame duration.
-    bool synthesize_timestamps{false};
-    /// The container had a populated index right after avformat_find_stream_info (MP4, indexed
-    /// AVI/FLV). Indices that grow lazily during seeks (MPEG-TS flags every probed packet as a
-    /// keyframe) are never consulted for the forward-or-seek decision.
-    bool index_trusted{false};
-  };
-
   static constexpr int max_consecutive_errors = 32;
-  /// Consecutive avformat_seek_file failures (never counting interrupted I/O) before the pipeline
-  /// stops seeking and decodes forward / re-opens instead.
-  static constexpr int max_seek_failures = 3;
   /// Hard cap on landing back-offs per request; the doubling step reaches the start long before.
   static constexpr int max_backoffs = 64;
 
   Pipeline(std::string source, Options options)
       : source_(std::move(source)), opt_(std::move(options)) {}
 
+  // What the source learned about the chosen video stream. MediaSource is the only writer; the
+  // handful of fields the pipeline has to change (the time origin, the decoder's frame rate,
+  // seekability after a run of failed seeks) go back through named MediaSource methods, so no
+  // caller can set one behind its back.
+  [[nodiscard]] const StreamInfo& stream() const noexcept { return source_.getStreamInfo(); }
+
  public:
   ~Pipeline() = default;
 
  private:
-  static int interrupt_callback(void* opaque) noexcept {
-    auto* self = static_cast<Pipeline*>(opaque);
-    if (self == nullptr) return 0;
-    if (self->current_token_ != nullptr && self->current_token_->requested()) {
-      // Recorded here because libavio's own state does not preserve it: see
-      // recover_after_interrupt(). Same thread as the request that is being interrupted.
-      self->interrupt_fired_ = true;
-      return 1;
-    }
-    return 0;
-  }
-
-  [[nodiscard]] std::expected<void, Error> open_input() {
-    AVFormatContext* raw = avformat_alloc_context();
-    if (raw == nullptr) return fail(ErrorCode::out_of_memory, "avformat_alloc_context");
-    raw->interrupt_callback.callback = &Pipeline::interrupt_callback;
-    raw->interrupt_callback.opaque = this;
-    raw->flags |= AVFMT_FLAG_GENPTS;
-    DictPtr dict;
-    {
-      AVDictionary* d = nullptr;
-      for (const auto& [key, value] : opt_.demuxer_options)
-        av_dict_set(&d, key.c_str(), value.c_str(), 0);
-      dict.reset(d);
-    }
-    AVDictionary* dict_raw = dict.release();
-    // avformat_open_input frees and nulls `raw` on failure, so wrap only on success. Wrap it
-    // *before* the unknown-option check: that check returns on a source that opened fine, and an
-    // open context reached only through `raw` would be leaked.
-    const int r = avformat_open_input(&raw, source_.c_str(), nullptr, &dict_raw);
-    dict.reset(dict_raw);  // whatever was not consumed
-    if (r >= 0) fmt_.reset(raw);
-    if (auto bad = unknown_demuxer_options(dict.get()); !bad.empty()) {
-      return fail(ErrorCode::invalid_argument,
-                  "demuxer_options: no such option in this FFmpeg build: " + bad +
-                      " (a key libavformat knows but does not apply to this source is accepted)");
-    }
-    if (r < 0) {
-      ErrorCode code = ErrorCode::open_failed;
-      if (r == k::enoent) code = ErrorCode::file_not_found;
-      if (r == k::invalid_data) code = ErrorCode::unsupported_format;
-      return fail(code, r, "avformat_open_input(\"" + source_ + "\")");
-    }
-
-    // avformat_find_stream_info() decodes to fill in what the container did not declare, so an
-    // oversized frame costs memory there too. Most containers (MP4, Matroska) declare the size in
-    // their header: if every video stream already declares more than the cap, refuse before that.
-    if (auto r2 = check_declared_size(); !r2) return r2;
-    if (int r2 = avformat_find_stream_info(fmt_.get(), nullptr); r2 < 0) {
-      return fail(ErrorCode::unsupported_format, r2, "avformat_find_stream_info");
-    }
-
-    const AVCodec* codec = nullptr;
-    int idx = av_find_best_stream(fmt_.get(), AVMEDIA_TYPE_VIDEO,
-                                  opt_.video_stream_index.value_or(-1), -1, &codec, 0);
-    if (idx == k::decoder_not_found) {
-      return fail(ErrorCode::decoder_not_found, idx,
-                  "av_find_best_stream: no decoder for the video stream");
-    }
-    if (idx < 0) {
-      if (opt_.video_stream_index) {
-        return fail(ErrorCode::invalid_argument, idx,
-                    "stream " + std::to_string(*opt_.video_stream_index) +
-                        " is not a decodable video stream");
-      }
-      return fail(ErrorCode::no_video_stream, idx,
-                  "av_find_best_stream: no video stream in \"" + source_ + "\"");
-    }
-    // Cover art is a "video" stream to libavformat; not to us, unless asked for.
-    if ((fmt_->streams[idx]->disposition & AV_DISPOSITION_ATTACHED_PIC) != 0 &&
-        !opt_.allow_attached_pictures && !opt_.video_stream_index) {
-      int alt = -1;
-      for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
-        AVStream* s = fmt_->streams[i];
-        if (s->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-            (s->disposition & AV_DISPOSITION_ATTACHED_PIC) == 0 &&
-            avcodec_find_decoder(s->codecpar->codec_id) != nullptr) {
-          alt = static_cast<int>(i);
-          break;
-        }
-      }
-      if (alt < 0) {
-        return fail(
-            ErrorCode::no_video_stream,
-            "the only video stream is an attached picture (set Options::allow_attached_pictures)");
-      }
-      idx = alt;
-      codec = avcodec_find_decoder(fmt_->streams[idx]->codecpar->codec_id);
-    }
-    if (codec == nullptr) {
-      return fail(ErrorCode::decoder_not_found, "no decoder available for the selected stream");
-    }
-    codec_desc_ = codec;
-    st_ = fmt_->streams[idx];
-    if (opt_.max_input_pixels) {
-      // Before the decoder exists: setting it up and probing the first frame is what allocates for
-      // the declared frame size, and a hostile file costs a few hundred bytes to declare it.
-      const std::int64_t pixels = static_cast<std::int64_t>(std::max(st_->codecpar->width, 0)) *
-                                  std::max(st_->codecpar->height, 0);
-      if (pixels > *opt_.max_input_pixels) {
-        return fail(ErrorCode::unsupported_format,
-                    "the video stream is " + std::to_string(st_->codecpar->width) + "x" +
-                        std::to_string(st_->codecpar->height) + " = " + std::to_string(pixels) +
-                        " pixels, over Options::max_input_pixels (" +
-                        std::to_string(*opt_.max_input_pixels) + ")");
-      }
-    }
-    for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
-      if (static_cast<int>(i) != idx) fmt_->streams[i]->discard = AVDISCARD_ALL;
-    }
-
-    stream_ = StreamInfo{};
-    stream_.index = idx;
-    stream_.time_base = st_->time_base;
-    if (stream_.time_base.num <= 0 || stream_.time_base.den <= 0) {
-      return fail(ErrorCode::unsupported_format, "video stream has an invalid time base");
-    }
-    if (st_->start_time != k::no_pts) {
-      stream_.start_pts = st_->start_time;
-    } else if (fmt_->start_time != k::no_pts) {
-      stream_.start_pts = av_rescale_q(fmt_->start_time, k::time_base_q, stream_.time_base);
-    }
-    if (st_->duration != k::no_pts && st_->duration > 0) {
-      stream_.duration_pts = st_->duration;
-    } else if (fmt_->duration != k::no_pts && fmt_->duration > 0) {
-      stream_.duration_pts = av_rescale_q(fmt_->duration, k::time_base_q, stream_.time_base);
-    }
-    stream_.avg_frame_rate = st_->avg_frame_rate;
-    const AVRational fr = st_->avg_frame_rate.num > 0 ? st_->avg_frame_rate : st_->r_frame_rate;
-    if (fr.num > 0 && fr.den > 0) {
-      stream_.frame_duration_hint = av_rescale_q(1, AVRational{fr.den, fr.num}, stream_.time_base);
-    }
-    // Same priority as av_guess_sample_aspect_ratio (and therefore ffmpeg/ffplay): the container's
-    // declaration wins over the bitstream's; a frame-level SAR sits in between (see convert()).
-    stream_.container_sar = st_->sample_aspect_ratio;
-    stream_.codec_sar = st_->codecpar->sample_aspect_ratio;
-    stream_.transform = read_transform(*st_->codecpar);
-    stream_.io_seekable = fmt_->pb != nullptr && (fmt_->pb->seekable & AVIO_SEEKABLE_NORMAL) != 0;
-    // Raw elementary streams (AVFMT_NOTIMESTAMPS) have nothing to seek by; libavformat's generic
-    // seek fails and may leave the demuxer mid-file, so such inputs are decoded forward or
-    // re-opened.
-    stream_.seekable = stream_.io_seekable && (fmt_->iformat->flags & AVFMT_NOTIMESTAMPS) == 0 &&
-                       seek_failures_ < max_seek_failures;
-    stream_.synthesize_timestamps = (fmt_->iformat->flags & AVFMT_NOTIMESTAMPS) != 0;
-    stream_.index_trusted = avformat_index_get_entries_count(st_) > 0;
-
+  /// The pipeline's own half of opening: the decoder libavformat picked for the stream, the packet
+  /// and frame buffers, and the converter (whose orientation comes from the stream's display
+  /// matrix). Runs after every MediaSource open and re-open, and owns nothing MediaSource owns.
+  [[nodiscard]] std::expected<void, Error> attach_to_source() {
+    codec_desc_ = source_.getCodec();
     auto pkt = make_packet();
     if (!pkt) return std::unexpected(pkt.error());
     pkt_ = std::move(*pkt);
@@ -497,81 +305,11 @@ class Pipeline {
       slot->install(std::move(*fr2));
     }
     const DisplayTransform applied =
-        opt_.apply_preferred_track_transform ? stream_.transform : DisplayTransform{};
+        opt_.apply_preferred_track_transform ? stream().transform : DisplayTransform{};
     converter_.emplace(opt_.pixel_format, opt_.scaler, opt_.maximum_size,
                        opt_.apply_sample_aspect_ratio, applied.rotation, applied.mirrored,
                        /*strip_display_matrix=*/opt_.apply_preferred_track_transform);
     return {};
-  }
-
-  /// Demuxer options libavformat left unconsumed *and* does not define anywhere: a misspelling.
-  /// A key it defines but did not apply here is legitimate — an HTTP option that a local path
-  /// never reaches — and is not reported. Returns them comma-separated, or empty.
-  [[nodiscard]] static std::string unknown_demuxer_options(AVDictionary* left) {
-    std::string bad;
-    const AVDictionaryEntry* e = nullptr;
-    while ((e = av_dict_iterate(left, e)) != nullptr) {
-      if (option_exists(e->key)) continue;
-      if (!bad.empty()) bad += ", ";
-      bad += '"';
-      bad += e->key;
-      bad += '"';
-    }
-    return bad;
-  }
-
-  /// Whether any of libavformat's option classes (the context, the demuxers, the protocols)
-  /// defines `key`.
-  [[nodiscard]] static bool option_exists(const char* key) noexcept {
-    const AVClass* fc = avformat_get_class();
-    if (av_opt_find(&fc, key, nullptr, 0, AV_OPT_SEARCH_FAKE_OBJ | AV_OPT_SEARCH_CHILDREN) !=
-        nullptr)
-      return true;
-    void* it = nullptr;
-    while (const AVClass* child = av_opt_child_class_iterate(fc, &it)) {
-      if (av_opt_find(&child, key, nullptr, 0, AV_OPT_SEARCH_FAKE_OBJ | AV_OPT_SEARCH_CHILDREN) !=
-          nullptr)
-        return true;
-    }
-    return false;
-  }
-
-  /// Options::max_input_pixels against what the container declared, before anything decodes. Only
-  /// refuses when *every* video stream is over the cap and has a declared size: a stream whose size
-  /// is unknown here is decided by the check in open_input() once stream info has been read.
-  [[nodiscard]] std::expected<void, Error> check_declared_size() const {
-    if (!opt_.max_input_pixels) return {};
-    int worst_w = 0, worst_h = 0;
-    bool any_video = false;
-    for (unsigned i = 0; i < fmt_->nb_streams; ++i) {
-      const AVCodecParameters& par = *fmt_->streams[i]->codecpar;
-      if (par.codec_type != AVMEDIA_TYPE_VIDEO) continue;
-      any_video = true;
-      const std::int64_t pixels =
-          static_cast<std::int64_t>(std::max(par.width, 0)) * std::max(par.height, 0);
-      if (pixels <= *opt_.max_input_pixels) return {};  // one of them might be usable
-      if (pixels > static_cast<std::int64_t>(worst_w) * worst_h) {
-        worst_w = par.width;
-        worst_h = par.height;
-      }
-    }
-    if (!any_video || worst_w <= 0) return {};
-    return fail(ErrorCode::unsupported_format,
-                "the video stream is " + std::to_string(worst_w) + "x" + std::to_string(worst_h) +
-                    " = " + std::to_string(static_cast<std::int64_t>(worst_w) * worst_h) +
-                    " pixels, over Options::max_input_pixels (" +
-                    std::to_string(*opt_.max_input_pixels) + ")");
-  }
-
-  /// The display transform from the stream's display matrix side data (codecpar->coded_side_data,
-  /// the non-deprecated path on FFmpeg 6.1 and 7.x).
-  [[nodiscard]] static DisplayTransform read_transform(const AVCodecParameters& par) noexcept {
-    const AVPacketSideData* sd = av_packet_side_data_get(
-        par.coded_side_data, par.nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
-    if (sd == nullptr || sd->size < 9 * sizeof(std::int32_t)) return DisplayTransform{};
-    std::int32_t matrix[9];
-    std::memcpy(matrix, sd->data, sizeof matrix);
-    return decode_display_matrix(matrix);
   }
 
   [[nodiscard]] std::expected<void, Error> build_codec(const HwCandidate* hw) {
@@ -583,10 +321,11 @@ class Pipeline {
 
     CodecCtxPtr cc{avcodec_alloc_context3(codec_desc_)};
     if (!cc) return fail(ErrorCode::out_of_memory, "avcodec_alloc_context3");
-    if (int r = avcodec_parameters_to_context(cc.get(), st_->codecpar); r < 0) {
+    if (int r = avcodec_parameters_to_context(cc.get(), source_.getStream()->codecpar); r < 0) {
       return fail(ErrorCode::decoder_open_failed, r, "avcodec_parameters_to_context");
     }
-    cc->pkt_timebase = st_->time_base;  // required for best_effort_timestamp / frame->duration
+    // required for best_effort_timestamp / frame->duration
+    cc->pkt_timebase = source_.getStream()->time_base;
     // The same cap inside libavcodec, so a resolution change mid-stream is refused by the decoder
     // rather than allocated for.
     if (opt_.max_input_pixels) cc->max_pixels = *opt_.max_input_pixels;
@@ -633,15 +372,11 @@ class Pipeline {
       return fail(hw != nullptr ? ErrorCode::hardware_unavailable : ErrorCode::decoder_open_failed,
                   r, std::string("avcodec_open2(") + codec_desc_->name + ")");
     }
-    if (stream_.synthesize_timestamps && cc->framerate.num > 0 && cc->framerate.den > 0) {
-      stream_.frame_duration_hint =
-          av_rescale_q(1, AVRational{cc->framerate.den, cc->framerate.num}, stream_.time_base);
-      stream_.avg_frame_rate = cc->framerate;
+    if (stream().synthesize_timestamps && cc->framerate.num > 0 && cc->framerate.den > 0) {
+      source_.adoptDecoderFrameRate(cc->framerate);
     }
-    if (stream_.synthesize_timestamps && stream_.frame_duration_hint <= 0) {
-      stream_.frame_duration_hint =
-          av_rescale_q(1, AVRational{1, 25}, stream_.time_base);  // libav's own default
-      stream_.avg_frame_rate = AVRational{25, 1};
+    if (stream().synthesize_timestamps && stream().frame_duration_hint <= 0) {
+      source_.adoptDecoderFrameRate(AVRational{25, 1});  // libav's own default
     }
     codec_ = std::move(cc);
     hw_active_ = hw != nullptr;
@@ -654,7 +389,7 @@ class Pipeline {
   /// downloaded, so hardware only pays for the more expensive codecs at larger sizes; software wins
   /// H.264 at every size. The thresholds below were chosen from measurement on the author's machine
   /// — a starting point, not a portable truth; tune them for yours.
-  [[nodiscard]] static bool hardware_worthwhile(const AVCodecParameters& par,
+  [[nodiscard]] static bool isHardwareWorthwhile(const AVCodecParameters& par,
                                                 const AVCodec& codec) noexcept {
     const std::int64_t pixels =
         static_cast<std::int64_t>(std::max(par.width, 0)) * std::max(par.height, 0);
@@ -675,18 +410,18 @@ class Pipeline {
     std::string reason;
     Options effective = opt_;
     if (effective.hardware.policy == HardwarePolicy::automatic) {
-      effective.hardware.policy = hardware_worthwhile(*st_->codecpar, *codec_desc_)
+      effective.hardware.policy = isHardwareWorthwhile(*source_.getStream()->codecpar, *codec_desc_)
                                       ? HardwarePolicy::prefer_hardware
                                       : HardwarePolicy::software_only;
     }
     std::vector<HwCandidate> candidates = hw_candidates(codec_desc_, effective, reason);
     if (opt_.hardware.policy == HardwarePolicy::automatic &&
         effective.hardware.policy == HardwarePolicy::software_only) {
-      reason = "automatic policy: software decoding is faster for " +
-               std::to_string(st_->codecpar->width) + "x" + std::to_string(st_->codecpar->height) +
-               " " + codec_desc_->name;
+      const AVCodecParameters& par = *source_.getStream()->codecpar;
+      reason = "automatic policy: software decoding is faster for " + std::to_string(par.width) +
+               "x" + std::to_string(par.height) + " " + codec_desc_->name;
     }
-    if (!candidates.empty() && !stream_.io_seekable) {
+    if (!candidates.empty() && !stream().io_seekable) {
       // Probing a candidate decodes the first frame and a rejected one needs the input rewound;
       // a pipe cannot be rewound, so the probe would consume it. Software needs exactly one pass.
       candidates.clear();
@@ -771,9 +506,9 @@ class Pipeline {
     } else {
       positioned_ = true;
       landed_at_start_ = true;
-      seek_target_ = stream_.start_pts;
+      seek_target_ = stream().start_pts;
     }
-    auto sel = select(stream_.start_pts, std::numeric_limits<std::int64_t>::min(),
+    auto sel = select(stream().start_pts, std::numeric_limits<std::int64_t>::min(),
                       std::numeric_limits<std::int64_t>::max(), none);
     if (!sel) {
       if (hw_active_)
@@ -785,9 +520,8 @@ class Pipeline {
     }
     first_frame_ts_ = frame_ts(*sel->frame);
     probe_frame_ = sel->frame;
-    if (st_->start_time == k::no_pts && fmt_->start_time == k::no_pts) {
-      stream_.start_pts = first_frame_ts_;  // raw streams: anchor Time::zero() at the first frame
-    }
+    // Raw streams: anchor Time::zero() at the first frame.
+    if (source_.needsStartPtsFromFirstFrame()) source_.setStartPts(first_frame_ts_);
     return {};
   }
 
@@ -798,52 +532,51 @@ class Pipeline {
   }
 
   [[nodiscard]] AVRational effective_sar() const noexcept {
-    if (stream_.container_sar.num > 0 && stream_.container_sar.den > 0)
-      return stream_.container_sar;
+    if (stream().container_sar.num > 0 && stream().container_sar.den > 0)
+      return stream().container_sar;
     if (probe_frame_ != nullptr && probe_frame_->sample_aspect_ratio.num > 0 &&
         probe_frame_->sample_aspect_ratio.den > 0) {
       return probe_frame_->sample_aspect_ratio;
     }
-    if (stream_.codec_sar.num > 0 && stream_.codec_sar.den > 0) return stream_.codec_sar;
+    if (stream().codec_sar.num > 0 && stream().codec_sar.den > 0) return stream().codec_sar;
     return AVRational{1, 1};
   }
 
   void fill_info() {
     info_ = AssetInfo{};
-    info_.container_name =
-        fmt_->iformat != nullptr && fmt_->iformat->name != nullptr ? fmt_->iformat->name : "";
+    info_.container_name = source_.getContainerName();
     info_.codec_name = codec_desc_->name;
-    const auto src_fmt = static_cast<AVPixelFormat>(st_->codecpar->format);
+    const auto src_fmt = static_cast<AVPixelFormat>(source_.getStream()->codecpar->format);
     const char* fmt_name = av_get_pix_fmt_name(src_fmt);
     if (fmt_name == nullptr && probe_frame_ != nullptr) {
       fmt_name = av_get_pix_fmt_name(static_cast<AVPixelFormat>(probe_frame_->format));
     }
     info_.source_pixel_format = fmt_name != nullptr ? fmt_name : "";
-    info_.video_stream_index = stream_.index;
-    info_.time_base = from_av(stream_.time_base);
+    info_.video_stream_index = stream().index;
+    info_.time_base = from_av(stream().time_base);
     info_.average_frame_rate =
-        stream_.avg_frame_rate.num > 0 ? from_av(stream_.avg_frame_rate) : Rational{0, 1};
-    if (stream_.duration_pts) {
-      info_.duration = Time::from_timestamp(*stream_.duration_pts, info_.time_base);
+        stream().avg_frame_rate.num > 0 ? from_av(stream().avg_frame_rate) : Rational{0, 1};
+    if (stream().duration_pts) {
+      info_.duration = Time::from_timestamp(*stream().duration_pts, info_.time_base);
     }
-    if (st_->nb_frames > 0) info_.frame_count = st_->nb_frames;
-    Size coded{st_->codecpar->width, st_->codecpar->height};
+    if (source_.getStream()->nb_frames > 0) info_.frame_count = source_.getStream()->nb_frames;
+    Size coded{source_.getStream()->codecpar->width, source_.getStream()->codecpar->height};
     if (probe_frame_ != nullptr && probe_frame_->width > 0)
       coded = Size{probe_frame_->width, probe_frame_->height};
     info_.coded_size = coded;
     const AVRational sar = effective_sar();
-    const int rot = opt_.apply_preferred_track_transform ? stream_.transform.rotation : 0;
+    const int rot = opt_.apply_preferred_track_transform ? stream().transform.rotation : 0;
     info_.display_size = display_size(coded, sar, opt_.apply_sample_aspect_ratio, rot);
     info_.output_size = converter_->output_size(coded, sar);
-    info_.rotation_degrees = stream_.transform.rotation;
-    info_.mirrored = stream_.transform.mirrored;
+    info_.rotation_degrees = stream().transform.rotation;
+    info_.mirrored = stream().transform.mirrored;
     info_.sample_aspect_ratio = from_av(sar);
-    info_.seekable = stream_.seekable;
-    info_.timestamps_synthesized = stream_.synthesize_timestamps;
+    info_.seekable = stream().seekable;
+    info_.timestamps_synthesized = stream().synthesize_timestamps;
     const auto name_or_empty = [](const char* n) {
       return n != nullptr ? std::string{n} : std::string{};
     };
-    const AVCodecParameters& par = *st_->codecpar;
+    const AVCodecParameters& par = *source_.getStream()->codecpar;
     info_.color_transfer = par.color_trc != AVCOL_TRC_UNSPECIFIED
                                ? name_or_empty(av_color_transfer_name(par.color_trc))
                                : std::string{};
@@ -893,13 +626,6 @@ class Pipeline {
     if (land_pkt_) av_packet_unref(land_pkt_.get());
   }
 
-  [[nodiscard]] int raw_seek(std::int64_t ts) noexcept {
-    ++cur_.seeks;
-    // min_ts = INT64_MIN, ts = max_ts: "the keyframe at or before ts", never later.
-    return avformat_seek_file(fmt_.get(), stream_.index, std::numeric_limits<std::int64_t>::min(),
-                              ts, ts, 0);
-  }
-
   void after_seek(std::int64_t target, bool at_start) noexcept {
     avcodec_flush_buffers(codec_.get());
     reset_position();
@@ -912,7 +638,7 @@ class Pipeline {
 
   /// Seeks towards `target`. Where the seek actually landed is established by read_landing().
   [[nodiscard]] std::expected<void, Error> seek_to(std::int64_t target) {
-    const int r = raw_seek(target);
+    const int r = source_.seekTo(target);
     if (r < 0) {
       // The demuxer may have moved; nothing held is trustworthy any more.
       reset_position();
@@ -926,8 +652,7 @@ class Pipeline {
   /// Positions on a recorded keyframe packet by byte offset (containers without a trusted index).
   /// The next packet read is that keyframe.
   [[nodiscard]] std::expected<void, Error> byte_seek(const KeyEntry& e) {
-    ++cur_.seeks;
-    const int r = av_seek_frame(fmt_.get(), -1, e.pos, AVSEEK_FLAG_BYTE);
+    const int r = source_.byteSeekTo(e.pos);
     if (r < 0) {
       reset_position();
       positioned_ = false;
@@ -942,40 +667,42 @@ class Pipeline {
   /// mov and to the first cue in Matroska; index-based demuxers that reject an out-of-range
   /// timestamp get a plain seek to start_pts, and if that fails too the input is re-opened.
   [[nodiscard]] std::expected<void, Error> seek_to_start() {
-    if (!stream_.seekable) {
-      if (!stream_.io_seekable) {
+    if (!stream().seekable) {
+      if (!stream().io_seekable) {
         return fail(ErrorCode::not_seekable, "the source cannot be rewound");
       }
       return reopen();
     }
-    const std::int64_t margin = av_rescale_q(10, AVRational{1, 1}, stream_.time_base);
-    const std::int64_t floor_ts = std::numeric_limits<std::int64_t>::min() / 2;
-    const std::int64_t early =
-        stream_.start_pts - margin < floor_ts ? floor_ts : stream_.start_pts - margin;
-    int r = raw_seek(early);
-    if (r < 0 && r != k::exit_requested) r = raw_seek(stream_.start_pts);
+    const int r = source_.seekToStart();
     if (r < 0) {
       reset_position();
       positioned_ = false;
       if (r == k::exit_requested)
         return fail(ErrorCode::seek_failed, r, "avformat_seek_file(start)");
-      if (!stream_.io_seekable) {
+      if (!stream().io_seekable) {
         return fail(ErrorCode::not_seekable, r,
                     "seeking to the start failed and the source cannot be re-opened");
       }
       return reopen();
     }
-    after_seek(stream_.start_pts, true);
+    after_seek(stream().start_pts, true);
     return {};
   }
 
-  /// Re-opens the input from scratch (non-seekable sources that must rewind, or after a failed
-  /// seek). The re-probe runs its I/O through the interrupt callback, so under a cancelled request
-  /// it keeps only what it managed to read: a duration short of the real one would then reject
-  /// legitimate times for the life of the generator. Hence no re-open under an already-cancelled
-  /// request, and the old duration is kept when a cancellation lands mid-probe.
+  /// Re-establishes the source from scratch (non-seekable sources that must rewind, or after a
+  /// failed seek) and rebuilds the decoder on top of it.
+  ///
+  /// MediaSource::reopen() re-opens the container and returns: the container and the decoder have
+  /// different lifetimes (this one container outlives two or three decoder rebuilds on the hardware
+  /// fallback path), so the order of the two is decided here rather than buried in the re-open.
+  /// build_codec() is what resets the decode position, exactly as it does for every other rebuild.
+  ///
+  /// No re-open under an already-cancelled request: the re-probe runs its I/O through the interrupt
+  /// callback and would keep only what it managed to read. Checked here rather than inside
+  /// MediaSource, because by the time the container is touched this has already given up its
+  /// decoder, and a cancelled request must not pay that.
   [[nodiscard]] std::expected<void, Error> reopen() {
-    if (current_token_ != nullptr && current_token_->requested()) {
+    if (source_.isCancelled()) {
       return fail(ErrorCode::cancelled, k::exit_requested,
                   "cancelled before re-opening the source");
     }
@@ -985,66 +712,48 @@ class Pipeline {
       hw.pix_fmt = hw_state_->hw_pix_fmt;
       hw.type = hw_type_;
     }
-    const std::int64_t start_pts = stream_.start_pts;
-    const std::optional<std::int64_t> duration = stream_.duration_pts;
-    const bool had_stream = st_ != nullptr;
     codec_.reset();
-    fmt_.reset();
-    st_ = nullptr;
     positioned_ = false;
-    auto r = open_input();
+    auto r = source_.reopen(opt_);
+    if (r) r = attach_to_source();
     if (r) r = build_codec(was_hw ? &hw : nullptr);
     if (!r) {
       // The old context is gone and the new one failed; image_at() retries on the next request.
+      // close() is idempotent: MediaSource::reopen() has already closed when it was the step that
+      // failed, and has not when attach_to_source() or build_codec() was.
       codec_.reset();
-      fmt_.reset();
-      st_ = nullptr;
+      source_.close();
       broken_reason_ = r.error().message;
       return fail(ErrorCode::seek_failed, r.error().av_error,
                   "re-opening the source: " + r.error().message);
     }
     tail_end_ = k::no_pts;  // a re-opened (or grown) source may reach further than it did
     verified_to_ = k::no_pts;
-    if (had_stream) {
-      stream_.start_pts = start_pts;  // keep the time origin established at open()
-      // And the duration: an interrupted probe under-reports it, never over-reports it, so a
-      // longer answer is a source that genuinely grew and a shorter one is a truncated read.
-      if (duration && (!stream_.duration_pts || *stream_.duration_pts < *duration))
-        stream_.duration_pts = duration;
-    }
     positioned_ = true;
     awaiting_key_ = true;
     landed_at_start_ = true;
-    seek_target_ = stream_.start_pts;
+    seek_target_ = stream().start_pts;
     return {};
   }
 
-  /// An interrupt that fired inside libavformat I/O leaves the AVIOContext refusing to read. Clear
-  /// it and forget the position: the next request seeks (which resets the I/O layer properly) or,
-  /// on a pipe, continues from where the read stopped.
+  /// Throws away everything the decoder and this pipeline believed after an interrupt aborted a
+  /// libavformat read. MediaSource clears libavio's sticky state and flushes the demuxer; the
+  /// decoder flush, the frontier and the position are this pipeline's to drop.
   ///
-  /// The state left behind is not reliably `error == AVERROR_EXIT` — the MPEG-TS demuxer turns the
-  /// short read into AVERROR_EOF, and a later seek clears `error` but not `eof_reached`, which on
-  /// its own is indistinguishable from a genuine EOF. So the interrupt is recorded when it fires
-  /// (interrupt_callback) rather than inferred here, and consumed either way.
-  ///
-  /// Returns false when the sticky state could not be cleared in place -- a libavformat major
-  /// tryResetIoState() was never verified against -- and the source can be re-opened. The caller
-  /// must then re-establish it before the next read; nothing else clears the I/O layer.
+  /// Returns false when the sticky state could not be cleared in place (see
+  /// MediaSource::recoverAfterInterrupt) and the source can be re-opened. The caller must then
+  /// re-establish it before the next read; nothing else clears the I/O layer.
   [[nodiscard]] bool recover_after_interrupt() noexcept {
-    const bool fired = std::exchange(interrupt_fired_, false);
-    if (!fmt_ || fmt_->pb == nullptr) return true;
-    if (fmt_->pb->error != k::exit_requested && !(fired && fmt_->pb->eof_reached != 0)) return true;
-    const bool cleared = tryResetIoState(*fmt_->pb);
+    const MediaSource::IoState io = source_.recoverAfterInterrupt();
+    if (io == MediaSource::IoState::clean) return true;
     const std::int64_t last = frontier.lastReceivedTs;
-    avformat_flush(fmt_.get());
     if (codec_) avcodec_flush_buffers(codec_.get());
     reset_position();
-    if (!cleared && stream_.io_seekable) {
+    if (io == MediaSource::IoState::stuck && stream().io_seekable) {
       positioned_ = false;  // nothing here can unstick the I/O layer; the caller re-opens
       return false;
     }
-    if (stream_.seekable) {
+    if (stream().seekable) {
       positioned_ = false;  // forces a seek in position_for()
     } else {
       // Best effort on a non-rewindable input: the demuxer is somewhere at or after the last frame.
@@ -1062,14 +771,14 @@ class Pipeline {
   /// libavformat major where it cannot be cleared in place, the source is re-opened instead.
   [[nodiscard]] std::expected<void, Error> retry_after_empty_eof(std::int64_t P,
                                                                  const CancelToken& token) {
-    if (fmt_ && fmt_->pb != nullptr && !tryResetIoState(*fmt_->pb) && stream_.io_seekable) {
+    if (!source_.tryResetIo() && stream().io_seekable) {
       // An unverified libavformat major: the sticky end-of-file survives a seek, so the source is
       // re-established rather than retried in place. Slower by one re-open, and correct.
       reset_position();
       if (auto r = reopen(); !r) return r;
       return position_for(P, keyframe_only_, token);
     }
-    avformat_flush(fmt_.get());
+    source_.flushDemuxer();
     if (codec_) avcodec_flush_buffers(codec_.get());
     reset_position();
     positioned_ = false;  // forces a real seek rather than a decode-forward
@@ -1079,15 +788,15 @@ class Pipeline {
   /// Seeks towards `target`, with the failure policy: interrupted I/O is reported as is, other
   /// failures count towards giving up on seeking and fall back to a re-open.
   [[nodiscard]] std::expected<void, Error> seek_or_reopen(std::int64_t target) {
-    if (target <= stream_.start_pts) return seek_to_start();
+    if (target <= stream().start_pts) return seek_to_start();
     auto r = seek_to(target);
     if (r) {
-      seek_failures_ = 0;
+      source_.noteSeekSucceeded();
       return {};
     }
     if (r.error().av_error == k::exit_requested) return r;
-    if (++seek_failures_ >= max_seek_failures) stream_.seekable = false;
-    if (!stream_.io_seekable) {
+    source_.noteSeekFailed();
+    if (!stream().io_seekable) {
       return fail(ErrorCode::not_seekable, r.error().av_error,
                   "seeking failed and the source cannot be re-opened");
     }
@@ -1095,10 +804,22 @@ class Pipeline {
   }
 
   [[nodiscard]] std::int64_t one_second() const noexcept {
-    return av_rescale_q(1, AVRational{1, 1}, stream_.time_base);
+    return av_rescale_q(1, AVRational{1, 1}, stream().time_base);
   }
   [[nodiscard]] std::int64_t frames_ticks(int n) const noexcept {
-    return stream_.frame_duration_hint > 0 ? n * stream_.frame_duration_hint : 0;
+    return stream().frame_duration_hint > 0 ? n * stream().frame_duration_hint : 0;
+  }
+
+  /// Whether the decoder can still reach `target` by decoding on from where it is.
+  ///
+  /// The invariant: continuing forward answers with frames the decoder has yet to produce, so it
+  /// is sound only while every frame between the decoder's frontier and `target` will actually
+  /// come out. A gap there — a non-reference frame skipped for a request that was abandoned before
+  /// it got there — would be the frame on screen, and nothing may be concluded across one.
+  [[nodiscard]] bool canDecodeForwardTo(std::int64_t target) const noexcept {
+    return positioned_ && !frontier.drained && !frontier.eof &&
+           frontier.lastReceivedTs != k::no_pts && target >= frontier.lastReceivedTs &&
+           !frontier.skipped.containsIn(frontier.lastReceivedTs, target);
   }
 
   /// Decides between continuing to decode forward and seeking, then positions accordingly. In
@@ -1108,18 +829,12 @@ class Pipeline {
                                                         const CancelToken& token) {
     backoffs_ = 0;
     backoff_step_ = 0;
-    // Continuing forward answers from frames the decoder has yet to produce, so it is only sound
-    // while every frame between the decoder's frontier and P will actually come out: a gap there
-    // (a non-reference frame skipped for an abandoned request) would be the frame on screen.
-    const bool forward_ok = positioned_ && !frontier.drained && !frontier.eof &&
-                            frontier.lastReceivedTs != k::no_pts && P >= frontier.lastReceivedTs &&
-                            !frontier.skipped.containsIn(frontier.lastReceivedTs, P);
-    if (!stream_.seekable) {
-      if (forward_ok) return {};
+    if (!stream().seekable) {
+      if (canDecodeForwardTo(P)) return {};
       if (positioned_ && !frontier.drained && !frontier.eof &&
           frontier.lastReceivedTs == k::no_pts && landed_at_start_)
         return {};
-      if (!stream_.io_seekable) {
+      if (!stream().io_seekable) {
         return fail(
             ErrorCode::not_seekable,
             "the source is not seekable; requested times must not precede the current position");
@@ -1127,7 +842,7 @@ class Pipeline {
       return reopen();
     }
     if (!keyframe_mode) {
-      if (forward_ok && forward_is_cheaper(P)) return {};
+      if (canDecodeForwardTo(P) && isForwardCheaperThanSeek(P)) return {};
       if (positioned_ && !frontier.drained && !frontier.eof &&
           frontier.lastReceivedTs == k::no_pts && seek_target_ <= P &&
           P - seek_target_ <= forward_scan_limit()) {
@@ -1135,7 +850,7 @@ class Pipeline {
                     // select()
       }
     }
-    if (stream_.index_trusted) return position_indexed(P, keyframe_mode, token);
+    if (stream().index_trusted) return position_indexed(P, keyframe_mode, token);
     return position_scanned(P, keyframe_mode, token);
   }
 
@@ -1152,7 +867,7 @@ class Pipeline {
         if (auto r = seek_or_reopen(target); !r) return r;
       }
       need_seek = true;
-      if (!stream_.seekable) return {};  // gave up on seeking: the re-open positioned at the start
+      if (!stream().seekable) return {};  // gave up on seeking: the re-open positioned at the start
       auto land = read_landing(P, /*scan=*/false, keyframe_mode, token);
       if (!land) return std::unexpected(std::move(land.error()));
       if (land->found || landed_at_start_ || !key_flags_reliable_) return {};
@@ -1185,7 +900,7 @@ class Pipeline {
                                                                   bool keyframe_mode,
                                                                   const CancelToken& token) {
     if (auto r = seek_to_start(); !r) return r;
-    auto land = read_landing(P, /*scan=*/!stream_.index_trusted, keyframe_mode, token);
+    auto land = read_landing(P, /*scan=*/!stream().index_trusted, keyframe_mode, token);
     if (!land) return std::unexpected(std::move(land.error()));
     return {};
   }
@@ -1207,7 +922,7 @@ class Pipeline {
     std::int64_t aim = P - margin - (gop_hint_ > 0 ? gop_hint_ : 0);
     if (auto r = seek_or_reopen(aim); !r) return r;
     for (;;) {
-      if (!stream_.seekable) return {};
+      if (!stream().seekable) return {};
       auto land = read_landing(P, /*scan=*/true, keyframe_mode, token);
       if (!land) return std::unexpected(std::move(land.error()));
       if (land->found || landed_at_start_ || !key_flags_reliable_) return {};
@@ -1230,14 +945,14 @@ class Pipeline {
     if (earlier >= seek_target_)
       earlier = seek_target_ - backoff_step_;  // always strictly earlier than last time
     if (backoff_step_ < std::numeric_limits<std::int64_t>::max() / 2) backoff_step_ *= 2;
-    if (++backoffs_ >= max_backoffs || earlier <= stream_.start_pts) return seek_to_start();
+    if (++backoffs_ >= max_backoffs || earlier <= stream().start_pts) return seek_to_start();
     return seek_or_reopen(earlier);
   }
 
   /// Without a trusted index, decode forward when the target is within one GOP (at least 3 s):
   /// a seek would land in the same or the next GOP and decode about as many frames anyway.
   [[nodiscard]] std::int64_t forward_scan_limit() const noexcept {
-    const std::int64_t three_seconds = av_rescale_q(3, AVRational{1, 1}, stream_.time_base);
+    const std::int64_t three_seconds = av_rescale_q(3, AVRational{1, 1}, stream().time_base);
     return std::max(three_seconds, gop_hint_);
   }
 
@@ -1247,20 +962,20 @@ class Pipeline {
   /// learned from the first keyframe packet) moves P there. Matroska cues are in the PTS domain and
   /// its packets carry no DTS, so the shift is zero.
   [[nodiscard]] const AVIndexEntry* index_key_before(std::int64_t P) const noexcept {
-    const int n = avformat_index_get_entries_count(st_);
+    const int n = avformat_index_get_entries_count(source_.getStream());
     if (n <= 0) return nullptr;
     const std::int64_t shift = index_shift();
     const std::int64_t ts = P > std::numeric_limits<std::int64_t>::min() + shift ? P - shift : P;
-    int e = av_index_search_timestamp(st_, ts, AVSEEK_FLAG_BACKWARD);
+    int e = av_index_search_timestamp(source_.getStream(), ts, AVSEEK_FLAG_BACKWARD);
     if (e < 0) return nullptr;
     if (e == n - 1) {
-      const AVIndexEntry* last = avformat_index_get_entry(st_, e);
+      const AVIndexEntry* last = avformat_index_get_entry(source_.getStream(), e);
       if (last == nullptr ||
-          ts > last->timestamp + std::max<std::int64_t>(2 * stream_.frame_duration_hint, 1))
+          ts > last->timestamp + std::max<std::int64_t>(2 * stream().frame_duration_hint, 1))
         return nullptr;
     }
     for (; e >= 0; --e) {
-      const AVIndexEntry* entry = avformat_index_get_entry(st_, e);
+      const AVIndexEntry* entry = avformat_index_get_entry(source_.getStream(), e);
       if (entry == nullptr) return nullptr;
       if ((entry->flags & AVINDEX_KEYFRAME) != 0) return entry;
     }
@@ -1271,11 +986,11 @@ class Pipeline {
   /// target has already been fed to the decoder (both sides in the container's own timestamp
   /// domain), or the distance is short. Cost-aware for slow seeks (hardware): frames between the
   /// current position and that keyframe are decoded forward while they cost less than a seek.
-  [[nodiscard]] bool forward_is_cheaper(std::int64_t target) const noexcept {
+  [[nodiscard]] bool isForwardCheaperThanSeek(std::int64_t target) const noexcept {
     std::int64_t key_ts = k::no_pts;  // the covering keyframe, in the same domain as fed_ts
     std::int64_t fed_ts = k::no_pts;
     bool covered = false;
-    if (stream_.index_trusted) {
+    if (stream().index_trusted) {
       if (const AVIndexEntry* kf = index_key_before(target); kf != nullptr) {
         key_ts = kf->timestamp;
         fed_ts = last_fed_index_ts();
@@ -1288,17 +1003,17 @@ class Pipeline {
     }
     if (covered && key_ts != k::no_pts && fed_ts != k::no_pts) {
       // The covering keyframe has been fed: the target is downstream of the decoder's state.
-      if (key_ts <= fed_ts + std::max<std::int64_t>(stream_.frame_duration_hint, 0)) return true;
+      if (key_ts <= fed_ts + std::max<std::int64_t>(stream().frame_duration_hint, 0)) return true;
       // A keyframe lies ahead: forward wins while the frames up to it cost less than a seek (a
       // real trade on hardware decoders and tiny frames).
-      if (costs.getFrameCostMs() > 0 && stream_.frame_duration_hint > 0) {
-        const double frames_to_key =
-            static_cast<double>(key_ts - fed_ts) / static_cast<double>(stream_.frame_duration_hint);
+      if (costs.getFrameCostMs() > 0 && stream().frame_duration_hint > 0) {
+        const double frames_to_key = static_cast<double>(key_ts - fed_ts) /
+                                     static_cast<double>(stream().frame_duration_hint);
         return frames_to_key * costs.getFrameCostMs() < costs.getSeekCostMs();
       }
       return false;
     }
-    if (stream_.index_trusted)
+    if (stream().index_trusted)
       return target - frontier.lastReceivedTs <=
              frames_ticks(
                  4);  // the index does not cover P (unread fragment): seeks are exact there
@@ -1320,7 +1035,7 @@ class Pipeline {
   /// Records a keyframe packet; links it to the previous keyframe when the packets in between were
   /// read contiguously (so that keyframe's GOP extent becomes known).
   void record_key(std::int64_t pts, std::int64_t dts, std::int64_t pos) {
-    if (pts == k::no_pts || pos < 0 || stream_.index_trusted) return;
+    if (pts == k::no_pts || pos < 0 || stream().index_trusted) return;
     std::size_t i = key_lower_bound(pts);
     if (i < key_index_.size() && key_index_[i].pts == pts) {
       key_index_[i].dts = dts;
@@ -1356,7 +1071,7 @@ class Pipeline {
   /// not the keyframe covering P. The DTS index is shifted by the *smallest* reorder delay, so an
   /// open-GOP I-frame may be placed a frame early: a true result only makes read_landing scan on.
   [[nodiscard]] bool index_has_key_between(std::int64_t key_pts, std::int64_t P) const noexcept {
-    if (!stream_.index_trusted) return false;
+    if (!stream().index_trusted) return false;
     const AVIndexEntry* kf = index_key_before(P);
     if (kf == nullptr) return false;
     const std::int64_t kf_pts = kf->timestamp + index_shift();
@@ -1367,7 +1082,7 @@ class Pipeline {
   /// from the container index (MP4/Matroska) or the recorded keyframe index (MPEG-TS).
   [[nodiscard]] bool key_covers(std::int64_t key_pts, std::int64_t P) const noexcept {
     if (key_pts > P) return false;
-    if (stream_.index_trusted) {
+    if (stream().index_trusted) {
       const AVIndexEntry* kf = index_key_before(P);
       if (kf == nullptr) return false;
       // mov indexes DTS (a keyframe's pts is its dts plus the reorder delay); Matroska cues are
@@ -1392,11 +1107,11 @@ class Pipeline {
     if (f.best_effort_timestamp != k::no_pts) return f.best_effort_timestamp;
     if (f.pts != k::no_pts) return f.pts;
     if (f.pkt_dts != k::no_pts) return f.pkt_dts;
-    return frontier.synthTs != k::no_pts ? frontier.synthTs : stream_.start_pts;
+    return frontier.synthTs != k::no_pts ? frontier.synthTs : stream().start_pts;
   }
 
   [[nodiscard]] std::int64_t frame_duration(const AVFrame& f) const noexcept {
-    return f.duration > 0 ? f.duration : stream_.frame_duration_hint;
+    return f.duration > 0 ? f.duration : stream().frame_duration_hint;
   }
 
   // The received frame becomes the answer. The look-ahead slot is emptied with it: no frame past
@@ -1471,7 +1186,7 @@ class Pipeline {
     }
     for (;;) {
       if (token.requested()) return k::exit_requested;
-      int r = av_read_frame(fmt_.get(), pkt_.get());
+      int r = source_.readPacket(*pkt_);
       if (r == k::exit_requested) return r;
       if (r == k::eof || (r < 0 && ++demux_errors_ > max_consecutive_errors)) return k::eof;
       if (r < 0) {
@@ -1479,10 +1194,10 @@ class Pipeline {
         continue;  // transient demux error: skip and keep reading
       }
       demux_errors_ = 0;
-      if (pkt_->stream_index == stream_.index && pkt_->pts != k::no_pts) {
+      if (pkt_->stream_index == stream().index && pkt_->pts != k::no_pts) {
         verified_to_ = verified_to_ == k::no_pts ? pkt_->pts : std::max(verified_to_, pkt_->pts);
       }
-      if (pkt_->stream_index != stream_.index) {
+      if (pkt_->stream_index != stream().index) {
         av_packet_unref(pkt_.get());
         continue;
       }
@@ -1521,32 +1236,6 @@ class Pipeline {
     gop_buffer_bytes_ = 0;
     replay_pos_ = 0;
     replaying_ = false;
-  }
-
-  /// Clears libavio's sticky end-of-file / error state so reading can continue after an interrupt
-  /// inside a read. Poking `eof_reached` / `error` is not promised to keep the demuxer consistent,
-  /// so it is confined to the libavformat majors it was verified against -- 60 (FFmpeg 6.1),
-  /// 61 (7.1), 62 (8.0) and 63 (9.0), each one built and the suite run against it. On any other
-  /// major it changes nothing and returns false; the caller re-establishes the source instead,
-  /// which costs one re-open per interrupt recovery. That is the right trade against failing the
-  /// build, which would stop every consumer -- including the ones that never cancel -- over a
-  /// path they never reach.
-  ///
-  /// Why an unknown major cannot simply seek instead: a same-position avio_seek clears
-  /// `eof_reached` but leaves `error` set -- `s->eof_reached = 0` on every exit path, `s->error`
-  /// never assigned; read from source at n7.1.2 / n8.0 / n9.0.1 (avio_seek itself changed in 9,
-  /// this property did not) and confirmed behaviourally at 60 by the suite. And avio_read returns
-  /// `s->error` whenever it read nothing, while the case this function exists for is exactly
-  /// `pb->error == AVERROR_EXIT` -- so seeking alone would leave every later read failing.
-  [[nodiscard]] static bool tryResetIoState(AVIOContext& pb) noexcept {
-#if LIBAVFORMAT_VERSION_MAJOR <= 63
-    pb.eof_reached = 0;
-    pb.error = 0;
-    return true;
-#else
-    (void)pb;
-    return false;
-#endif
   }
 
   /// Result of read_landing().
@@ -1693,7 +1382,7 @@ class Pipeline {
     clear_gop_buffer();
     // GOP too large to buffer: go back to the keyframe by byte position (trusted-index containers
     // refuse byte seeks and re-seek by timestamp below).
-    if (best_pos >= 0 && !stream_.index_trusted) {
+    if (best_pos >= 0 && !stream().index_trusted) {
       const std::size_t i = key_lower_bound(best_pts);
       if (i < key_index_.size() && key_index_[i].pts == best_pts) {
         if (auto r = byte_seek(key_index_[i]); !r) return std::unexpected(std::move(r.error()));
@@ -1823,11 +1512,11 @@ class Pipeline {
         decode_errors_ = 0;
         costs.noteFirstFrame();
         if (hw_active_) ++hw_frames_seen_;
-        if (stream_.synthesize_timestamps) {
+        if (stream().synthesize_timestamps) {
           const std::int64_t stamped =
-              frontier.synthTs != k::no_pts ? frontier.synthTs : stream_.start_pts;
+              frontier.synthTs != k::no_pts ? frontier.synthTs : stream().start_pts;
           recv_->pts = recv_->best_effort_timestamp = stamped;
-          recv_->duration = stream_.frame_duration_hint;
+          recv_->duration = stream().frame_duration_hint;
         }
         const std::int64_t t = frame_ts(*recv_);
         frontier.synthTs = t + frame_duration(*recv_);
@@ -1891,7 +1580,7 @@ class Pipeline {
         // the stream (provable only after the explicit start seek) or the seek landed late. A late
         // landing is backed off even when a later frame would satisfy the `after` tolerance: the
         // frame actually on screen at P exists until proven otherwise.
-        const bool at_start = landed_at_start_ || !stream_.seekable ||
+        const bool at_start = landed_at_start_ || !stream().seekable ||
                               (first_frame_ts_ != k::no_pts && t <= first_frame_ts_);
         const bool landing = frontier.receivedSinceSeek == 1;
         const std::int64_t observed_key = key ? t : k::no_pts;
@@ -1913,7 +1602,7 @@ class Pipeline {
       if (r == k::eof) {
         // Nothing decodable between the landing and the end of the stream. Back off unless the
         // start seek has already been done, in which case the stream really has no frame for P.
-        if (!held_.isValid() && !corrupt_last_.isValid() && stream_.seekable && positioned_ &&
+        if (!held_.isValid() && !corrupt_last_.isValid() && stream().seekable && positioned_ &&
             !landed_at_start_ && !frontier.drained) {
           if (auto s = back_off(P, k::no_pts); !s) return std::unexpected(std::move(s.error()));
           continue;
@@ -1923,8 +1612,8 @@ class Pipeline {
         // reported the end, which is what libavio's sticky eof_reached does after a cancellation
         // (a seek does not clear it). Clear it and re-position once before concluding the stream
         // ended — `landed_at_start_` above would otherwise accept that first read as proof.
-        if (!held_.isValid() && !corrupt_last_.isValid() && stream_.seekable && !frontier.drained &&
-            frontier.receivedSinceSeek == 0 && !eof_retried_) {
+        if (!held_.isValid() && !corrupt_last_.isValid() && stream().seekable &&
+            !frontier.drained && frontier.receivedSinceSeek == 0 && !eof_retried_) {
           eof_retried_ = true;
           if (auto s = retry_after_empty_eof(P, token); !s)
             return std::unexpected(std::move(s.error()));
@@ -1977,8 +1666,8 @@ class Pipeline {
       return fail(
           ErrorCode::time_out_of_range,
           "requested time is past the last frame (" +
-              to_string(Time::from_timestamp(std::max<std::int64_t>(t - stream_.start_pts, 0),
-                                             from_av(stream_.time_base))) +
+              to_string(Time::from_timestamp(std::max<std::int64_t>(t - stream().start_pts, 0),
+                                             from_av(stream().time_base))) +
               ")");
     };
     if (held_.isValid()) return finish(held_.getFrame(), held_.isConcealed());
@@ -2020,8 +1709,8 @@ class Pipeline {
         }
         if (r == k::eof) {
           tail_end_ = verified_to_ != k::no_pts
-                          ? verified_to_ + std::max<std::int64_t>(stream_.frame_duration_hint, 1)
-                          : t + std::max<std::int64_t>(stream_.frame_duration_hint, 1);
+                          ? verified_to_ + std::max<std::int64_t>(stream().frame_duration_hint, 1)
+                          : t + std::max<std::int64_t>(stream().frame_duration_hint, 1);
           break;
         }
         av_packet_unref(pkt_.get());
@@ -2037,8 +1726,9 @@ class Pipeline {
     return fail(
         ErrorCode::time_out_of_range,
         "requested time is past the last frame (" +
-            to_string(Time::from_timestamp(std::max<std::int64_t>(tail_end_ - stream_.start_pts, 0),
-                                           from_av(stream_.time_base))) +
+            to_string(Time::from_timestamp(
+                std::max<std::int64_t>(tail_end_ - stream().start_pts, 0),
+                from_av(stream().time_base))) +
             ")");
   }
 
@@ -2048,9 +1738,52 @@ class Pipeline {
   /// decoding forward across the jump ends with a frame from the *earlier* segment, and concluding
   /// "the stream has no frame past this one" from it strands the generator, because the
   /// end-of-stream shortcut then answers every later request without ever repositioning.
-  [[nodiscard]] bool held_is_tail() const noexcept {
+  [[nodiscard]] bool isHeldFrameAtTail() const noexcept {
     if (!held_.isValid()) return false;
     return frame_ts(*held_.getFrame()) + frame_duration(*held_.getFrame()) >= frontier.lastEnd;
+  }
+
+  /// Whether the held frame is the one on screen at `target`, as far as the frontier can say.
+  ///
+  /// The invariant: the held frame's display interval starts at or before `target` and every frame
+  /// between the two was produced. A frame skipped in between is the one on screen instead, so the
+  /// held frame does not cover `target` after all, whatever the look-ahead or the end of stream
+  /// say. What rules out a *later* frame covering `target` is mode-specific and stays with the
+  /// caller: the look-ahead frame or the end of stream in exact mode, the absence of a keyframe in
+  /// (held, target] in nearest-keyframe mode.
+  [[nodiscard]] bool isHeldFrameCovering(std::int64_t target) const noexcept {
+    if (!held_.isValid()) return false;  // guards getFrame()
+    const std::int64_t h = frame_ts(*held_.getFrame());
+    return h <= target && !frontier.skipped.containsIn(h, target);
+  }
+
+  /// Whether the look-ahead frame can become the held frame and the decode continue from there.
+  ///
+  /// The invariant: the pending frame begins at or before `target`, so the frame on screen at
+  /// `target` is it or one the decoder has yet to produce; every frame between it and `target` will
+  /// be produced; and reaching `target` that way costs less than seeking to it.
+  [[nodiscard]] bool canPromotePendingFrame(std::int64_t target) const noexcept {
+    if (!pending_.isValid() || frontier.drained) return false;  // isValid() guards getFrame()
+    const std::int64_t p = frame_ts(*pending_.getFrame());
+    return target >= p && !frontier.skipped.containsIn(p, target) &&
+           isForwardCheaperThanSeek(target);
+  }
+
+  /// Whether the request can be answered without repositioning, by decoding on from the held frame.
+  ///
+  /// The invariant: the decoder's next output is the frame after the held one, and every frame
+  /// between the held frame and `target` will be produced. An empty look-ahead slot is what says
+  /// nothing past the held frame has been received; `eof` and `drained` say the decoder has no more
+  /// to give without a flush; a recorded hole says one of the frames in between was skipped and
+  /// never will be produced. Any of those failing leaves the frame on screen at `target`
+  /// unestablishable from here, and the request has to position.
+  [[nodiscard]] bool canContinueFromHeldFrame(std::int64_t target) const noexcept {
+    if (!held_.isValid() || pending_.isValid() || frontier.eof || frontier.drained) {
+      return false;  // isValid() guards getFrame()
+    }
+    const std::int64_t h = frame_ts(*held_.getFrame());
+    return h <= target && !frontier.skipped.containsIn(h, target) &&
+           isForwardCheaperThanSeek(target);
   }
 
   /// Positions and selects (the caller converts).
@@ -2061,33 +1794,29 @@ class Pipeline {
     const bool infinite_before = lo == std::numeric_limits<std::int64_t>::min();
     // Nearest-keyframe mode (infinite `before`). Without a usable seek every frame is decoded
     // anyway, so fall back to exact selection instead of returning an arbitrary non-keyframe.
-    const bool keyframe_mode = infinite_before && stream_.seekable;
-    if (infinite_before && !stream_.seekable) {
+    const bool keyframe_mode = infinite_before && stream().seekable;
+    if (infinite_before && !stream().seekable) {
       lo = P;
       hi = P;
     }
-    // Fast path: the frame covering P is already held.
-    if (held_.isValid()) {
-      const std::int64_t h = frame_ts(*held_.getFrame());
-      // A skipped frame between the held frame and P is the one on screen: the held frame does not
-      // cover P after all, whatever the look-ahead or the end of stream say.
-      if (h <= P && !frontier.skipped.containsIn(h, P)) {
-        if (keyframe_mode) {
-          // The held frame is the keyframe covering P (the index says no keyframe lies in (h, P]).
-          if ((held_.getFrame()->flags & AV_FRAME_FLAG_KEY) != 0 && key_covers(h, P)) {
-            return verify_keyframe_tail(
-                Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()}, P, token);
-          }
-        } else {
-          if (pending_.isValid() && P < frame_ts(*pending_.getFrame())) {
-            return Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()};
-          }
-          if (frontier.eof && !pending_.isValid() && held_is_tail()) {
-            auto s = finish_at_eof(P);
-            if (!s) return std::unexpected(std::move(s.error()));
-            if (s->adjustment == Adjustment::none) s->adjustment = clamped_by_bounds;
-            return *s;
-          }
+    // Fast path: the frame covering P is already held, and nothing later covers it instead.
+    if (isHeldFrameCovering(P)) {
+      if (keyframe_mode) {
+        // The held frame is the keyframe covering P (the index says no keyframe lies in (h, P]).
+        const std::int64_t h = frame_ts(*held_.getFrame());
+        if ((held_.getFrame()->flags & AV_FRAME_FLAG_KEY) != 0 && key_covers(h, P)) {
+          return verify_keyframe_tail(
+              Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()}, P, token);
+        }
+      } else {
+        if (pending_.isValid() && P < frame_ts(*pending_.getFrame())) {
+          return Selected{held_.getFrame(), clamped_by_bounds, held_.isConcealed()};
+        }
+        if (frontier.eof && !pending_.isValid() && isHeldFrameAtTail()) {
+          auto s = finish_at_eof(P);
+          if (!s) return std::unexpected(std::move(s.error()));
+          if (s->adjustment == Adjustment::none) s->adjustment = clamped_by_bounds;
+          return *s;
         }
       }
     }
@@ -2110,21 +1839,16 @@ class Pipeline {
         // GOP). Answer with the first presented frame, clamped, decoded exactly: the decoder drops
         // the trimmed frames itself (AV_PKT_FLAG_DISCARD).
         keyframe_only_ = false;
-        P = lo = hi = first_frame_ts_ != k::no_pts ? first_frame_ts_ : stream_.start_pts;
+        P = lo = hi = first_frame_ts_ != k::no_pts ? first_frame_ts_ : stream().start_pts;
         clamped_by_bounds = Adjustment::keyframe_before_edit;
       } else if (auto r = arm_keyframe_decode(token); !r) {
         return std::unexpected(std::move(r.error()));
       }
-    } else if (pending_.isValid() && !frontier.drained && P >= frame_ts(*pending_.getFrame()) &&
-               !frontier.skipped.containsIn(frame_ts(*pending_.getFrame()), P) &&
-               forward_is_cheaper(P)) {
+    } else if (canPromotePendingFrame(P)) {
       held_.adopt(pending_);
       backoffs_ = 0;
       backoff_step_ = 0;
-    } else if (!(held_.isValid() && !pending_.isValid() && !frontier.eof && !frontier.drained &&
-                 frame_ts(*held_.getFrame()) <= P &&
-                 !frontier.skipped.containsIn(frame_ts(*held_.getFrame()), P) &&
-                 forward_is_cheaper(P))) {
+    } else if (!canContinueFromHeldFrame(P)) {
       if (auto r = position_for(P, false, token); !r) return std::unexpected(std::move(r.error()));
     } else {
       backoffs_ = 0;
@@ -2132,7 +1856,7 @@ class Pipeline {
     }
     costs.beginRequest();
     const int frames_before = cur_.frames_decoded;
-    const bool seeked = cur_.seeks > 0;
+    const bool seeked = getSeekCount() > 0;
     auto sel = select(P, lo, hi, token);
     if (!sel) {
       // A request abandoned before reaching its target fed packets under *its* skip window, and
@@ -2140,7 +1864,7 @@ class Pipeline {
       // window may never be produced, so nothing may continue forward across it. The next request
       // repositions — one seek per cancellation. A source that cannot be repositioned (a pipe)
       // relies on the recorded holes instead, and a request across one fails rather than lies.
-      if (skip_before_ts_ != k::no_pts && stream_.seekable) positioned_ = false;
+      if (skip_before_ts_ != k::no_pts && stream().seekable) positioned_ = false;
       return std::unexpected(std::move(sel.error()));
     }
     costs.learn(cur_.frames_decoded - frames_before, seeked);
@@ -2161,12 +1885,12 @@ class Pipeline {
       sw = std::move(*t);
       src = sw.get();
     }
-    auto out = converter_->convert(*src, stream_.container_sar, stream_.codec_sar, req_max_);
+    auto out = converter_->convert(*src, stream().container_sar, stream().codec_sar, req_max_);
     if (!out) return std::unexpected(std::move(out.error()));
     // A frame before the time origin (MPEG-TS whose start comes from another stream) is reported at
     // zero.
-    const std::int64_t t = std::max<std::int64_t>(frame_ts(*sel.frame) - stream_.start_pts, 0);
-    const Time actual = Time::from_timestamp(t, from_av(stream_.time_base));
+    const std::int64_t t = std::max<std::int64_t>(frame_ts(*sel.frame) - stream().start_pts, 0);
+    const Time actual = Time::from_timestamp(t, from_av(stream().time_base));
     const bool key = (sel.frame->flags & AV_FRAME_FLAG_KEY) != 0;
     const ColorRange range = from_av(static_cast<AVColorRange>((*out)->color_range));
     const std::int64_t dur = frame_duration(*sel.frame);
@@ -2175,15 +1899,13 @@ class Pipeline {
                                   actual.is_valid() ? actual : Time::zero(), key, sel.adjustment,
                                   sel.corrupt);
     if (dur > 0)
-      ImageAccess::set_duration(img, Time::from_timestamp(dur, from_av(stream_.time_base)));
+      ImageAccess::set_duration(img, Time::from_timestamp(dur, from_av(stream().time_base)));
     return img;
   }
 
-  std::string source_;
+  MediaSource source_;
   Options opt_;
 
-  FormatCtxPtr fmt_;
-  AVStream* st_{nullptr};
   const AVCodec* codec_desc_{nullptr};
   CodecCtxPtr codec_;
   BufferRefPtr hw_device_;
@@ -2194,7 +1916,6 @@ class Pipeline {
   bool hw_fault_{false};
   bool hw_retried_{false};  ///< the hardware decoder was rebuilt for the current run of failures
 
-  StreamInfo stream_;
   AssetInfo info_;
   mutable std::mutex active_mutex_;
   ActiveDecoder active_;  // guarded by active_mutex_
@@ -2205,7 +1926,7 @@ class Pipeline {
   FramePtr recv_;  ///< scratch: avcodec_receive_frame writes here, then a slot adopts it
   FrameSlot held_, pending_, corrupt_last_;
   DecodeFrontier frontier;  ///< where the decoder is; every reposition resets it
-  SeekCostModel costs;      ///< what a seek and a frame cost here; drives forward_is_cheaper()
+  SeekCostModel costs;      ///< what a seek and a frame cost; drives isForwardCheaperThanSeek()
   const AVFrame* probe_frame_{nullptr};
   bool positioned_{false};
   bool landed_at_start_{false};  ///< the last positioning was the explicit start seek or a re-open
@@ -2216,8 +1937,6 @@ class Pipeline {
   std::int64_t seek_target_{0};
   /// One re-position per request after an end of stream that decoded nothing (see select()).
   bool eof_retried_{false};
-  /// Set by interrupt_callback() when it aborts libav I/O, consumed by recover_after_interrupt().
-  bool interrupt_fired_{false};
   bool keyframe_only_{false};  ///< the current request is in nearest-keyframe mode
   std::int64_t gop_hint_{0};   ///< largest keyframe spacing observed, in stream ticks
   std::int64_t first_frame_ts_{k::no_pts};
@@ -2249,17 +1968,16 @@ class Pipeline {
   bool replaying_{false};  ///< the scan is over; read_video_packet serves gop_buffer_ first
   int demux_errors_{0};
   int decode_errors_{0};
-  int seek_failures_{0};  ///< consecutive avformat_seek_file failures (interrupts excluded)
   long total_decode_errors_{0};
-  const CancelToken* current_token_{nullptr};
   std::string
       broken_reason_;  ///< why the last re-open failed (the pipeline retries on the next request)
 
   /// What the current request has cost so far, reset at the start of each one. Not observability:
-  /// SeekCostModel::learn() reads frames_decoded, and forward_is_cheaper() decides
+  /// SeekCostModel::learn() reads frames_decoded, and isForwardCheaperThanSeek() decides
   /// seek-versus-decode-forward from the averages it maintains. Decoding thread only.
   struct RequestStats {
-    int seeks{0};           ///< avformat_seek_file / av_seek_frame calls made for this request
+    /// MediaSource's lifetime seek count when this request started; getSeekCount() differences it.
+    std::int64_t seeksAtStart{0};
     int frames_decoded{0};  ///< frames received from the decoder, look-ahead and skipped included
   };
   RequestStats cur_;

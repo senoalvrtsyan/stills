@@ -39,7 +39,7 @@ find_package(PkgConfig REQUIRED)
 # headers used to impose one -- an #error on a libavformat major the AVIOContext recovery had not
 # been verified against, on a path only a cancelled request reaches -- which pkg-config could not
 # see, so a newer FFmpeg configured cleanly and then died mid-compile. That guard is now
-# tryResetIoState() in detail/pipeline.hpp: above the verified range it returns false and the
+# tryResetIoState() in detail/media_source.hpp: above the verified range it returns false and the
 # caller re-opens the source, so a new major builds and costs one re-open per interrupt recovery on
 # a rewindable source. On a pipe there is nothing to re-open and the stuck read still fails -- the
 # same outcome as before, minus the build failure.
