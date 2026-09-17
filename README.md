@@ -3,7 +3,7 @@
 **A header-only C++23 `AVAssetImageGenerator` over FFmpeg.**
 
 `0.1.0` · MIT · developed on Linux against FFmpeg 6.1, suite also run against 7.1.2, 8.0 and
-9.0.1, with hardware decode exercised on VAAPI only · no CI.
+9.0.1, with hardware decode exercised on VAAPI and NVDEC here and VideoToolbox in review · no CI.
 
 Extracts still frames from a video asset at requested times, synchronously or asynchronously with
 cancellation, modelled on Apple's `AVAssetImageGenerator`. Header-only C++23 over `libavformat` /
@@ -83,22 +83,22 @@ std::cout << d.decoderName << (d.hardware ? " on " + d.deviceTypeName : " (softw
 A batch — one `Completion` per time, in request order, on the generator's worker thread:
 
 ```cpp
-auto request = gen->generateImages ({ 0s, 1s, 2s, 3s },
-                                    [&] (stills::Completion c)
-                                    {
-                                        switch (c.getStatus())
-                                        { // c.index says which of the four times this is
-                                        case stills::GenerationStatus::succeeded:
-                                            use (c.index, std::move (*c.result));
-                                            break;
-                                        case stills::GenerationStatus::failed:
-                                            log (c.requestedTime, c.result.error());
-                                            break;
-                                        case stills::GenerationStatus::cancelled:
-                                            break; // nothing decoded; the completion still came
-                                        }
-                                    });
+auto onFrame = [&] (stills::Completion c)
+{
+    switch (c.getStatus())
+    { // c.index says which of the four times this is
+    case stills::GenerationStatus::succeeded:
+        use (c.index, std::move (*c.result));
+        break;
+    case stills::GenerationStatus::failed:
+        log (c.requestedTime, c.result.error());
+        break;
+    case stills::GenerationStatus::cancelled:
+        break; // nothing decoded; the completion still came
+    }
+};
 
+auto request = gen->generateImages ({ 0s, 1s, 2s, 3s }, std::move (onFrame));
 request.wait();
 ```
 
@@ -112,13 +112,13 @@ request.wait();
 
 gen->cancelAll(); // every queued and in-flight item of this generator
 
-auto firstOnly = gen->generateImages (times,
-                                      [] (stills::Completion c)
-                                      {
-                                          if (c.index == 0)
-                                              c.cancelBatch(); // from inside the handler, which has no handle yet
-                                      });
+auto stopAfterFirst = [] (stills::Completion c)
+{
+    // From inside the handler, which has no AsyncRequest handle yet.
+    if (c.index == 0) c.cancelBatch();
+};
 
+auto firstOnly = gen->generateImages (times, std::move (stopAfterFirst));
 firstOnly.wait();
 ```
 
@@ -249,7 +249,7 @@ paths need.
   requested time — the last frame at or before it, not the nearest by timestamp. Requests round to
   the *nearest* stream tick, so `Time::frames(k, fps)` returns frame `k` even where the time base
   cannot represent `k/fps` exactly.
-- **Bounds.** Negative or non-finite times are `invalid_argument`. Past the last frame is
+- **Bounds.** Negative or non-finite times are `invalidArgument`. Past the last frame is
   `timeOutOfRange`, or that frame flagged under `clampToLastFrame`; before the first presented
   frame the request clamps to it and is flagged. Requests more than one frame beyond the declared
   duration are refused without decoding, so a container that understates its duration still serves
@@ -297,14 +297,85 @@ paths need.
   NVDEC does not renegotiate and is fine. That single driver pathology is where the codec rule came
   from; generalising it to every family is the part that does not hold.
 
-  It is kept as the default anyway, deliberately. Always-hardware would make that NVDEC case the
-  worst case (4.7× slower than doing nothing); always-software caps the loss at the ~1.9× above.
-  The honest fix is to put the exception on the *device family* rather than the codec, and that is a
-  behaviour change worth more than one machine's timings — which is exactly the mistake the current
-  rule already made. So: treat `automatic` as a floor, not as advice. **If your input is H.264 and
-  your device is VAAPI, VideoToolbox or QSV, set `preferHardware` and measure.** Note also that
+  A third machine, contributed by the review of this code: on Apple silicon, **VideoToolbox was
+  slower than software on H.264**. That is the opposite direction from VAAPI on the same codec, and
+  the cause is neither NVDEC's nor VAAPI's — on unified memory the CPU decoder is fast and the frame
+  is already where the converter wants it, while the GPU path pays session setup per flush plus a
+  surface download for a frame software hands over for free. Three device families, three different
+  answers for one codec. No table keyed on the codec can be right on all three.
+
+  It is kept as the default anyway, for now. Always-hardware would make the NVDEC case the worst
+  case (4.7× slower than doing nothing); always-software caps the loss at the ~1.9× above. So:
+  treat `automatic` as a floor, not as advice. **If your input is H.264 and your device is VAAPI or
+  QSV, set `preferHardware` and measure; on VideoToolbox, measure before you do.** Note also that
   hardware is the wrong choice for *sequential* access at any codec — software is 2–3× faster there,
   because the per-frame GPU readback stops being amortised.
+
+#### What `automatic` should be
+
+Measured, not predicted — and the measurement is already being taken. `SeekCostModel` maintains two
+exponential averages per generator: **seek cost** (positioning plus the first frame out of a flushed
+decoder) and **per-frame cost** (each further frame), split at the moment the first frame arrives.
+That split is what separates all three pathologies above: NVDEC's decoder rebuild and VideoToolbox's
+session setup land in the seek cost, VideoToolbox's surface download lands in the per-frame cost.
+Both are measured on your content, on your machine, and they already drive the
+seek-versus-decode-forward decision.
+
+Counting `get_format` renegotiations — the obvious instrumentation, and what an earlier draft of
+this README proposed — is the wrong *primary* signal, not merely an incomplete one. A count is a
+frequency, not a cost: H.264 renegotiates once per seek on *every* device, and the same count is a
+cheap context re-init on VAAPI, where hardware still wins, and a full CUVID rebuild on NVDEC, where
+it dominates — roughly ten times the cost, flagged identically. And VideoToolbox's problem is not
+renegotiation at all, so a counter would never fire on the one machine whose answer it most needs to
+change.
+
+The decision is about *(codec, resolution class, device type)* — not about the file — so it is made
+**once per process per such key**, not once per generator:
+
+1. `open()`: if the process already holds a decision for this key, start on the winning path.
+   Otherwise the codec/size table above is the *initial guess* — free, and right often enough to skip
+   the measurement in the common case.
+2. The first generator for a key runs that guess for about five requests, far enough past the cold
+   first seek for the averages to settle.
+3. Then **one** A/B on real content: decode the next request on the other path as well — same time,
+   same content, same output size — and compare total ms. One extra decode, not a synthetic probe.
+   An A/B inside `open()` is the wrong place: it doubles the already-slow hardware open, and a
+   three-seek sample is noisy in exactly the close cases.
+4. Keep the winner and cache it for the process. Switching reuses the decoder rebuild that already
+   exists for hardware-fault fallback. Later generators with the same key skip steps 2–3 and start
+   on the winning path. No re-decision within a process.
+5. Report it: `getActiveDecoder().fallbackReason` carries the numbers — *"automatic: software
+   9.6 ms/frame vs videotoolbox 14.1 ms/frame on this content"* — and the cached decision is
+   readable, so an operator can copy it into deployment config.
+
+On Apple silicon and H.264 the table says software, the first generator A/Bs VideoToolbox once, it
+loses, and every later H.264 generator in that process starts on software — the same answer as
+today, now because it was measured rather than guessed. On VAAPI the A/B tries hardware, hardware
+wins, and later generators start there, which today they never would. On NVDEC the A/B tries it, it
+is 4.7× slower, and it stays on software — the case the table was written for still comes out right.
+
+The cost: one extra decode per distinct content class per process, plus about five requests on a
+possibly wrong path for the first generator only. A process that opens one short file and exits
+behaves like today's table plus one A/B. The cache is process-wide shared state, which this library
+otherwise avoids; it needs a mutex and a reset hook, and that is the price. A renegotiation counter
+still earns a place in this design — as a *diagnostic* on `ActiveDecoder`, because it is what
+explains a bad hardware number to whoever reads the log. Not as the decision input.
+
+**None of this is implemented.** This revision changes no hardware behaviour: the table above is
+still exactly what `automatic` does. The argument is written down here and in
+`VideoDecoder::isHardwareWorthwhile`'s contract comment so that the next change to it starts from a
+reasoned position rather than from one more machine's timings.
+
+#### When to measure and when to configure
+
+Measuring per machine is the right default when nobody configured the machine: a desktop
+application, or a service whose pool mixes CPU-only and GPU nodes where the code cannot know which
+node it is running on. Inside a pool you control, the explicit policies beat any automatic one.
+`preferHardware`, `softwareOnly` and `hardware.deviceType` in deployment config give deterministic
+pixels across nodes — hardware and software decoders can differ at the pixel level, which quietly
+breaks content-hash caching — no warm-up, and no per-process A/B. The readable cached decision is
+how you find out what to put there. `automatic` is a default for unknown machines; a fleet is known
+machines.
 
   Any policy that tries hardware validates it by decoding the first frame inside `open()`, so a
   device that cannot be created or a profile the decoder declines is resolved before `open()`
@@ -323,7 +394,7 @@ message}`. `toString`, `operator<<` and a `std::formatter` are provided; `getErr
 | `fileNotFound`, `openFailed` | the source does not exist; `avformat_open_input` failed otherwise — permissions, protocol, a refused connection |
 | `unsupportedFormat`, `noVideoStream` | not a media container, stream info unreadable, or `maxInputPixels` exceeded; audio-only asset, or only cover art |
 | `decoderNotFound`, `decoderOpenFailed`, `hardwareUnavailable` | no decoder for the codec; `avcodec_open2` failed; `requireHardware` and no hardware path worked |
-| `invalid_argument`, `invalidState` | a bad `Options` combination, a negative or non-finite time, an unknown demuxer key, an empty source or one with an embedded NUL; a moved-from or `close()`d generator |
+| `invalidArgument`, `invalidState` | a bad `Options` combination, a negative or non-finite time, an unknown demuxer key, an empty source or one with an embedded NUL; a moved-from or `close()`d generator |
 | `timeOutOfRange`, `endOfStream` | past the last frame under `OutOfRangePolicy::error`; the stream ended before a frame covering the request appeared |
 | `decodeFailed`, `conversionFailed`, `outOfMemory` | corrupt data; scaling, conversion or a hardware transfer failed; allocation failed — reported as a failed request rather than left to terminate the worker |
 | `seekFailed`, `notSeekable`, `unusable` | positioning failed and re-opening failed; the source cannot be rewound and the request needs an earlier position; the input had to be re-opened and that failed — the next request retries |
@@ -333,12 +404,71 @@ message}`. `toString`, `operator<<` and a `std::formatter` are provided; `getErr
 
 ```
 stills::AssetImageGenerator (move-only handle) ──shared_ptr──▶ detail::Engine (heap, never moves)
-   │ imageAt(Time) ─── lock decoderMutex ─────────────────▶ ├─ detail::FramePipeline (all libav state)
+   │ imageAt(Time) ─── lock decoderMutex ─────────────────▶ ├─ detail::FramePipeline (owns the six below)
    │ generateImages(times, handler) ── enqueue ────────────▶ ├─ deque<shared_ptr<Batch>> + cv
    │ cancelAll()                                            ├─ std::thread worker
    └─ AsyncRequest (copyable) ──shared_ptr──▶ detail::Batch   └─ per item: lock; imageAt(t, token);
                                                                  unlock; handler(Completion)
 ```
+
+### Structure
+
+The decode machinery is six types plus four value types, all in `stills::detail`, all header-only,
+one principal type per header:
+
+| Header | Owns |
+|---|---|
+| `detail/stills_MediaSource.h` | the `AVFormatContext`, the chosen `AVStream`, `StreamInfo`, the interrupt callback, I/O recovery, the seek primitives, packet reads, re-open |
+| `detail/stills_PacketReader.h` | the live `AVPacket`, the keyframe parking slot, the GOP replay buffer, the landing scan, whether the demuxer's keyframe flags can be trusted |
+| `detail/stills_KeyframeIndex.h` | recorded keyframes and GOP extents, container-index queries, the B-frame reorder delay |
+| `detail/stills_VideoDecoder.h` | the `AVCodecContext`, the hardware device and session, send/receive/flush/drain, the skip policy, the `ActiveDecoder` snapshot |
+| `detail/stills_Positioner.h` | every decision about where to send the demuxer — and none of the sending |
+| `detail/stills_FramePipeline.h` | orchestration: request validation, the selection loop, end-of-stream policy, the hardware-fault ladder, `AssetInfo`, conversion |
+
+The values they pass around are `FrameSlot` (one owned frame together with `valid` and `concealed`,
+as one thing), `DecodeFrontier` (how far the decoder has got and what it never produced, including
+`SkippedFrames`), `Position` (where the demuxer was put and what that landing is known to be) and
+`SeekCostModel` (what a seek costs and what a frame costs, measured).
+
+**Why the cut is there.** The obvious split — input and decoder setup, positioning and the keyframe
+index, decoding and frame selection — does not survive contact with the state. Those three jobs
+share a *frontier*: what has been read, what has been fed to the decoder, what has come back out,
+and which frames were skipped on purpose. Positioning reads it to choose seek-versus-decode-forward,
+selection writes it, recovery invalidates it. Split on responsibility alone and the result is three
+classes holding back-pointers to each other — the same coupling, now with somewhere to hide. So the
+frontier is named first, owned by the decode loop, and handed to the positioner as a named `const&`:
+"reads the frontier" and "writes the frontier" live in the signatures instead of in a comment.
+
+Two of the six then fall out of that argument rather than out of a list of responsibilities.
+`PacketReader` exists because the landing scan is 130 lines of packet reading over a byte-level
+replay buffer — bookkeeping about packets, not a seek strategy. `KeyframeIndex` exists because it is
+the one piece that is a pure data structure, which makes it the one piece with direct unit tests and
+no container, no decoder and no file behind them. And input and decoder are two types rather than one
+because their lifetimes differ: a single container outlives two or three decoder rebuilds on the
+hardware fallback path, and it was `reopen()` rebuilding the codec inline that tied them together.
+
+**Two boundaries worth knowing, because they are not the obvious ones.** `Positioner` decides and
+never acts: `canDecodeForwardTo`, `isForwardCheaperThanSeek`, `getIndexedAim`, `getScanAim`,
+`nextBackoff` and `retryAfterOvershoot` return aims as data and `FramePipeline` performs them. A seek
+here is not a call, it is the invalidation of every other type's state — flush the decoder, empty
+three frame slots, reset the frontier, reset the reader's position and the index's contiguity, and
+only then record where you aimed — so a type that performed seeks would reach into five others,
+which is the orchestrator's job by definition. `PacketReader::readLanding()` reaches the same answer
+one size down: it chooses a keyframe and returns "go back to this one" as data. The dependency
+therefore runs one way throughout — `FramePipeline` drives the other five — and none of them knows
+about its owner or about another's owner.
+
+`Positioner` also holds no references at all; every decision takes a `PositioningView` built at the
+call and never stored, for the same reason `KeyframeIndex` takes a `ContainerIndex` by value: a
+re-open replaces the `AVFormatContext` and the `AVStream` underneath, and three of the callers sit on
+paths that can re-open. A reference member would be a stale-reference hazard waiting for someone to
+put a re-open inside a decision.
+
+The test this is held to is *"if I change X, what can break?"*, answerable from the header list
+alone. Seek strategy → `Positioner` and `KeyframeIndex`, which hold no frame and no decoder.
+Hardware handling → `VideoDecoder` and the ladder in `FramePipeline`, which touch no positioning
+state. Frame choice → `FramePipeline` and `FrameSlot`, which read the frontier and cannot write it
+behind the positioner's back.
 
 ### Accurate seeking
 
@@ -473,11 +603,14 @@ a handle does not cancel. Handlers must not throw, as with any `std::thread`.
   decoder pool would slot in behind the same API. Options other than the tolerance and the output
   box cannot change after `open()` — the pixel format determines the converter.
 - `HardwarePolicy::automatic` is a static table, not a measurement: it cannot know that this
-  machine's GPU beats its CPU, or the reverse. The pipeline already learns seek and per-frame costs
-  at runtime (`SeekCostModel`, feeding the seek-versus-decode-forward decision), and the NVDEC
-  pathology above is observable from this library's own `get_format` callback — counting
-  renegotiations per seek would detect it on any device instead of naming codecs. That is the
-  intended 1.0 answer; until then, `preferHardware` plus `getActiveDecoder()` is the honest override.
+  machine's GPU beats its CPU, or the reverse, and on three device families it now has three
+  different right answers for H.264. The intended 1.0 answer is measurement — the codec table as an
+  initial guess, then one A/B on real content per *(codec, resolution class, device type)* per
+  process, cached and reported in `fallbackReason` — spelled out under
+  ["What `automatic` should be"](#what-automatic-should-be). Not counting `get_format`
+  renegotiations, which an earlier draft of this README proposed and which is the wrong primary
+  signal for the reasons given there. Until it lands, `preferHardware` plus `getActiveDecoder()` is
+  the honest override.
 - `open()` blocks on all the I/O the demuxer does and cannot be cancelled; bound it with
   `demuxerOptions` such as `rw_timeout`.
 - Only right-angle display matrices are honoured (0/90/180/270 plus a horizontal mirror); other
@@ -493,12 +626,24 @@ a handle does not cancel. Handlers must not throw, as with any `std::thread`.
   fps default when the stream carries none, flagged by `AssetInfo::timestampsSynthesized`.
 - Header-only costs: any TU including `stills_Image.h`, `stills_AssetImageGenerator.h` or the umbrella header also sees
   the libav headers and ~1,000 of their macros, 52 unprefixed (`MKTAG`, `M_PI`, `NAN`, …) — the
-  value headers are FFmpeg-free so they can appear in yours instead. A plugin embedding stills also
+  value headers are FFmpeg-free so they can appear in yours instead. These headers are exported as
+  `SYSTEM INTERFACE`, so your build sees them through `-isystem` and your warnings do not apply to
+  them. If you put them on a plain `-I` path and enable `-Wshadow`, expect ~47 reports from 17
+  sites: constructor parameters that share a name with the member they initialise
+  (`Time (std::int64_t value, ...) : value (value)`), which is what dropping trailing member
+  underscores costs. All are legal and correct: sixteen are constructors whose body is empty, so the
+  parameter is the only thing in scope to name, and the seventeenth, `Converter::pooledFrame`,
+  shadows a member of a *different* type (`AVPixelFormat` parameter over a `PixelFormat` member), so
+  confusing the two would not compile. They are noise in your log, not defects. A plugin embedding stills also
   cannot be unloaded: GCC gives its function-local statics `STB_GNU_UNIQUE` binding and glibc marks
   such objects `NODELETE`, so build one with `-fno-gnu-unique` if it must `dlclose()`.
 - Exceptions are used internally though none crosses the API, so `-fno-exceptions` is unsupported
-  (`-fno-rtti` is fine). AV1, VVC, ProRes and DNxHR are expected to work but are untested here, as
-  is every hardware family but VAAPI. There is no CI.
+  (`-fno-rtti` is fine). AV1, VVC and DNxHR are expected to work but are untested. ProRes, 10-bit
+  HEVC and Matroska were run on real media in the review of this code, with the sampled timestamps
+  confirmed against a sequential decode — so those three are no longer on the untested list.
+  VideoToolbox has been timed on H.264 in review but not otherwise exercised; NVDEC and VAAPI are
+  exercised here; every other hardware family is untested. There is no CI, and the documented build
+  has not been run on an Apple toolchain by its author.
 
 ## License
 
