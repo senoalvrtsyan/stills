@@ -8,10 +8,9 @@
 // the pipeline's.
 //
 // That lifetime difference is the reason this type exists. A hardware fallback rebuilds the
-// decoder two or three times over one container, and the re-open path used to rebuild the decoder
-// as a side effect of re-establishing the source — which is what made "opening the input" and
-// "setting up the decoder" one inseparable blob. reopen() here re-opens the container and returns;
-// the caller rebuilds whatever it needs afterwards, in the order it chooses.
+// decoder two or three times over one container, so re-establishing the source must not imply
+// rebuilding the decoder. reopen() re-opens the container and returns; the caller rebuilds
+// whatever it needs afterwards, in the order it chooses.
 //
 // What deliberately stays out: probing the first frame, and the hardware-candidate loop that
 // probes one decoder after another. Probing means running the real selection loop against the real
@@ -633,9 +632,14 @@ private:
     // this property did not) and confirmed behaviourally at 60 by the suite. And avio_read returns
     // `s->error` whenever it read nothing, while the case this function exists for is exactly
     // `pb->error == AVERROR_EXIT` -- so seeking alone would leave every later read failing.
+    //
+    // STILLS_FORCE_UNVERIFIED_LIBAVFORMAT is a test-only override: it makes every major take the
+    // "unverified" branch, so the re-open fallback can be exercised on an FFmpeg that is in the
+    // verified range (tests/CMakeLists.txt, stills_tests_reopen_fallback). Never define it in a
+    // consumer build.
     [[nodiscard]] static bool tryResetIoState (AVIOContext& pb) noexcept
     {
-#if LIBAVFORMAT_VERSION_MAJOR <= 63
+#if LIBAVFORMAT_VERSION_MAJOR <= 63 && ! defined(STILLS_FORCE_UNVERIFIED_LIBAVFORMAT)
         pb.eof_reached = 0;
         pb.error = 0;
         return true;

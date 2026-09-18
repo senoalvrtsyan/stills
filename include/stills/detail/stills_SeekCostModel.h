@@ -12,7 +12,7 @@
 // which is why it is measured on the caller's machine and the caller's content rather than
 // predicted from a table. The same numbers are the right input for deciding whether a hardware
 // decoder is worth using at all, in place of the static codec/resolution rule the pipeline uses
-// today; that is a change for later, not this pass.
+// today (see VideoDecoder::isHardwareWorthwhile).
 //
 // Units are milliseconds throughout, and the clock is steady_clock. A zero cost means "not learned
 // yet" and callers check for it, which is why neither average is ever seeded with a guess.

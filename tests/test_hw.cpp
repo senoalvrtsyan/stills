@@ -120,6 +120,12 @@ TEST_CASE ("hw: requireHardware with automatic selection", "[hw][auto]")
 #include <unistd.h>
 TEST_CASE ("hw: non-rewindable input never probes hardware", "[hw]")
 {
+    // The reason string under test is the one the pipeline writes once it has hardware candidates
+    // to refuse. An FFmpeg built with no hardware device types produces no candidates at all, and
+    // reports that instead, so there is nothing for this test to check on such a build.
+    if (av_hwdevice_iterate_types (AV_HWDEVICE_TYPE_NONE) == AV_HWDEVICE_TYPE_NONE)
+        SKIP ("this FFmpeg build has no hardware device types");
+
     SECTION ("preferHardware falls back to software with the reason")
     {
         const int fd = ::open (fixture ("counter.mp4").c_str(), O_RDONLY);

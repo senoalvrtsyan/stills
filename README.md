@@ -176,7 +176,7 @@ reference for every knob, including when you would want it.
 | | |
 |---|---|
 | Compiler | C++23 with `std::expected` and `__int128`: GCC 13+, Clang 17+ with libc++ 16+, Xcode 15+. **MSVC is not supported.** |
-| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and the full suite run here against **6.1** (libavformat 60), **7.1.2** (61), **8.0** (62) and **9.0.1** (63) — 121/121 on each, hardware decode included. One recovery path — clearing libavio's sticky error state after a cancelled read — pokes `AVIOContext` fields directly and is enabled only for those four majors; on any other it is skipped and a rewindable source is re-opened instead, costing one extra re-open per interrupt recovery rather than failing the build. On a non-rewindable source (a pipe) there is nothing to re-open and the interrupted read still fails — the same outcome as before, minus the build failure. |
+| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and the full suite run here against **6.1** (libavformat 60), **7.1.2** (61), **8.0** (62) and **9.0.1** (63) — every test passing on each, hardware decode included (the suite had 121 tests at the time of those runs; the count since has grown with the tests listed below). One recovery path — clearing libavio's sticky error state after a cancelled read — pokes `AVIOContext` fields directly and is enabled only for those four majors; on any other it is skipped and a rewindable source is re-opened instead, costing one extra re-open per interrupt recovery rather than failing the build. On a non-rewindable source (a pipe) there is nothing to re-open and the interrupted read still fails — the same outcome as before, minus the build failure. |
 | Build | CMake ≥ 3.25 and `Threads`. **Every preset specifies the Ninja generator**, so install `ninja` or configure by hand with `-G`. Catch2 v3.16.0 is fetched at configure time unless `find_package(Catch2 3)` finds one. |
 | Standard | A top-level build pins `CMAKE_CXX_STANDARD 23`, `..._REQUIRED ON`, `..._EXTENSIONS OFF`, and sets `CXX_STANDARD 23` on the fetched Catch2 targets. CMake otherwise leaves Catch2 (`cxx_std_14`) at the compiler's default, and a standard mismatch makes our C++23 test TUs reference `StringMaker` specialisations Catch2 never emitted — the reported Apple Clang 17 link failure. Reproduced here only at C++14-vs-C++23; at C++17-vs-C++23 the symbol surface is identical on libstdc++, so **the Apple Clang mechanism itself is unverified — there is no Apple toolchain on this machine.** A consumer's settings are untouched. |
 | Fixtures | An `ffmpeg` **binary** (6.0+, for `-display_rotation` and `-fps_mode`) with `libx264`, and `python3` for one clip — which falls back to `tr` when absent. `libvpx-vp9` and `libx265` are optional; their tests skip themselves. |
@@ -207,8 +207,11 @@ libavcodec's own thread pool; `stills.hw` is excluded because TSan aborts inside
 > `ASAN_OPTIONS=detect_leaks=1`, which is the default on Linux but is not supported on every
 > Darwin target — drop that one variable if the preset refuses to start on macOS.
 
-`ctest` runs 121 tests: 120 Catch2 cases plus one ODR executable of three translation units, which
-is what makes "header-only" a checked claim rather than a hopeful one. The TSan suppression file is
+`ctest` runs 136 tests: 133 Catch2 cases in `stills_tests`, two more in `stills_tests_reopen_fallback`
+(the cancellation tests compiled with `STILLS_FORCE_UNVERIFIED_LIBAVFORMAT`, so the re-open fallback
+for a libavformat major outside the verified range is exercised on every FFmpeg), plus one ODR
+executable of three translation units, which is what makes "header-only" a checked claim rather than
+a hopeful one. The TSan suppression file is
 deliberately broad, so the check on it is to run the `[async]` and `[cancel]` cases with it removed
 entirely — they report nothing either way.
 
@@ -404,7 +407,7 @@ message}`. `toString`, `operator<<` and a `std::formatter` are provided; `getErr
 
 ```
 stills::AssetImageGenerator (move-only handle) ──shared_ptr──▶ detail::Engine (heap, never moves)
-   │ imageAt(Time) ─── lock decoderMutex ─────────────────▶ ├─ detail::FramePipeline (owns the six below)
+   │ imageAt(Time) ─── lock decoderMutex ─────────────────▶ ├─ detail::FramePipeline (owns the six below it)
    │ generateImages(times, handler) ── enqueue ────────────▶ ├─ deque<shared_ptr<Batch>> + cv
    │ cancelAll()                                            ├─ std::thread worker
    └─ AsyncRequest (copyable) ──shared_ptr──▶ detail::Batch   └─ per item: lock; imageAt(t, token);
@@ -413,7 +416,7 @@ stills::AssetImageGenerator (move-only handle) ──shared_ptr──▶ detail:
 
 ### Structure
 
-The decode machinery is six types plus four value types, all in `stills::detail`, all header-only,
+The decode machinery is seven types plus four value types, all in `stills::detail`, all header-only,
 one principal type per header:
 
 | Header | Owns |
@@ -423,7 +426,8 @@ one principal type per header:
 | `detail/stills_KeyframeIndex.h` | recorded keyframes and GOP extents, container-index queries, the B-frame reorder delay |
 | `detail/stills_VideoDecoder.h` | the `AVCodecContext`, the hardware device and session, send/receive/flush/drain, the skip policy, the `ActiveDecoder` snapshot |
 | `detail/stills_Positioner.h` | every decision about where to send the demuxer — and none of the sending |
-| `detail/stills_FramePipeline.h` | orchestration: request validation, the selection loop, end-of-stream policy, the hardware-fault ladder, `AssetInfo`, conversion |
+| `detail/stills_FrameSelector.h` | the decode loop, the held and look-ahead frames, the `DecodeFrontier`, the per-request mode and skip window, end-of-stream policy, the nearest-keyframe tail check — and none of the seeking |
+| `detail/stills_FramePipeline.h` | orchestration: request validation, the hardware-fault ladder, positioning as an action (seek, re-open, back-off, landing), `AssetInfo`, conversion |
 
 The values they pass around are `FrameSlot` (one owned frame together with `valid` and `concealed`,
 as one thing), `DecodeFrontier` (how far the decoder has got and what it never produced, including
@@ -436,10 +440,11 @@ share a *frontier*: what has been read, what has been fed to the decoder, what h
 and which frames were skipped on purpose. Positioning reads it to choose seek-versus-decode-forward,
 selection writes it, recovery invalidates it. Split on responsibility alone and the result is three
 classes holding back-pointers to each other — the same coupling, now with somewhere to hide. So the
-frontier is named first, owned by the decode loop, and handed to the positioner as a named `const&`:
-"reads the frontier" and "writes the frontier" live in the signatures instead of in a comment.
+frontier is named first, owned by the decode loop (`FrameSelector`), and handed to the positioner as
+a named `const&`: "reads the frontier" and "writes the frontier" live in the signatures instead of in
+a comment.
 
-Two of the six then fall out of that argument rather than out of a list of responsibilities.
+Two of the seven then fall out of that argument rather than out of a list of responsibilities.
 `PacketReader` exists because the landing scan is 130 lines of packet reading over a byte-level
 replay buffer — bookkeeping about packets, not a seek strategy. `KeyframeIndex` exists because it is
 the one piece that is a pure data structure, which makes it the one piece with direct unit tests and
@@ -454,9 +459,12 @@ here is not a call, it is the invalidation of every other type's state — flush
 three frame slots, reset the frontier, reset the reader's position and the index's contiguity, and
 only then record where you aimed — so a type that performed seeks would reach into five others,
 which is the orchestrator's job by definition. `PacketReader::readLanding()` reaches the same answer
-one size down: it chooses a keyframe and returns "go back to this one" as data. The dependency
-therefore runs one way throughout — `FramePipeline` drives the other five — and none of them knows
-about its owner or about another's owner.
+one size down: it chooses a keyframe and returns "go back to this one" as data, and
+`FrameSelector::select()` does the same one size up: when the decode loop finds the landing was
+wrong it returns "back off" or "the end of stream was spurious" as a `Step`, and `FramePipeline`
+performs the seek and calls it again. The dependency therefore runs one way throughout —
+`FramePipeline` drives the other six — and none of them knows about its owner or about another's
+owner.
 
 `Positioner` also holds no references at all; every decision takes a `PositioningView` built at the
 call and never stored, for the same reason `KeyframeIndex` takes a `ContainerIndex` by value: a
@@ -465,10 +473,11 @@ paths that can re-open. A reference member would be a stale-reference hazard wai
 put a re-open inside a decision.
 
 The test this is held to is *"if I change X, what can break?"*, answerable from the header list
-alone. Seek strategy → `Positioner` and `KeyframeIndex`, which hold no frame and no decoder.
-Hardware handling → `VideoDecoder` and the ladder in `FramePipeline`, which touch no positioning
-state. Frame choice → `FramePipeline` and `FrameSlot`, which read the frontier and cannot write it
-behind the positioner's back.
+alone. Seek strategy → `Positioner` and `KeyframeIndex`, which hold no frame and no decoder, plus the
+seek loops in `FramePipeline` that carry their aims out. Hardware handling → `VideoDecoder` and the
+ladder in `FramePipeline`, which touch no positioning state. Frame choice → `FrameSelector`, which
+owns the frontier and every write to it, and hands the positioner a `const&`; nothing outside it
+writes a frontier field.
 
 ### Accurate seeking
 
@@ -542,7 +551,7 @@ and `void(T*)` — and yields `FormatCtxPtr`, `CodecCtxPtr`, `FramePtr`, `Packet
 Creation functions with a `T**` out-parameter are wrapped only *after* success, which closes by
 construction the classic libav leak where a half-initialised context is dropped on an error path.
 Frames are `av_frame_unref`'d each iteration and moved with `av_frame_move_ref`, never copied; the
-codec context owns its `hw_device_ctx` reference and the pipeline owns the hardware device buffer
+codec context owns its `hw_device_ctx` reference and `VideoDecoder` owns the hardware device buffer
 and the `get_format` state. `detail/stills_FFmpeg.h` is the single libav include point, so the value
 headers stay FFmpeg-free and can appear in a consumer's own public headers.
 
@@ -631,10 +640,12 @@ a handle does not cancel. Handlers must not throw, as with any `std::thread`.
   them. If you put them on a plain `-I` path and enable `-Wshadow`, expect ~47 reports from 17
   sites: constructor parameters that share a name with the member they initialise
   (`Time (std::int64_t value, ...) : value (value)`), which is what dropping trailing member
-  underscores costs. All are legal and correct: sixteen are constructors whose body is empty, so the
-  parameter is the only thing in scope to name, and the seventeenth, `Converter::pooledFrame`,
-  shadows a member of a *different* type (`AVPixelFormat` parameter over a `PixelFormat` member), so
-  confusing the two would not compile. They are noise in your log, not defects. A plugin embedding stills also
+  underscores costs. Sixteen are constructors whose body is empty, so the parameter is the only thing
+  in scope to name; `Converter::pooledFrame` shadows a member of a *different* type (`AVPixelFormat`
+  parameter over a `PixelFormat` member), so confusing the two would not compile. The one constructor
+  with a body, `Time (value, timescale)`, names its members as `this->value` / `this->timescale`
+  where it assigns them, and `tests/test_time.cpp` pins that an invalid `Time` is normalised to 0/1 —
+  that assignment is exactly the site where a bare name would silently bind to the parameter. A plugin embedding stills also
   cannot be unloaded: GCC gives its function-local statics `STB_GNU_UNIQUE` binding and glibc marks
   such objects `NODELETE`, so build one with `-fno-gnu-unique` if it must `dlclose()`.
 - Exceptions are used internally though none crosses the API, so `-fno-exceptions` is unsupported

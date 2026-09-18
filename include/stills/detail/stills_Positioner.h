@@ -41,13 +41,9 @@ namespace stills::detail
 // Where the demuxer was put, and what that landing is known to be.
 //
 // The invariant the type exists for: a landing is established by one transition, never by writing
-// the fields one at a time. Before this they were members set by hand in fifteen places —
-// `afterSeek()` set the lot (these four and the synthetic-timestamp counter that is now the
-// frontier's), `reopen()` set four of the five and omitted one, `probeFirstFrame()` set three and
-// omitted two, and the rest wrote one each. All correct, by inspection rather than by
-// construction. Here every transition is a verb with a contract, so "positioned but still awaiting
-// a keyframe from a seek that never happened" is not a state a caller can reach by forgetting a
-// line.
+// the fields one at a time. Every transition is a verb with a contract, so "positioned but still
+// awaiting a keyframe from a seek that never happened" is not a state a caller can reach by
+// forgetting a line.
 //
 // `seekTarget` is meaningful only while `positioned`; the accessors do not enforce that because
 // every reader already tests `isPositioned()` (or is inside a landing that has just set it).

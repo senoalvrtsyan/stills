@@ -12,8 +12,7 @@
 // AVPackets scanned past a keyframe so the decoder can be fed them again without re-reading the
 // container. That belongs next to the packet it replays into, not inside a seek strategy and not
 // inside the decode loop. Packet *ownership* is the same argument from the other side: exactly one
-// object may av_packet_move_ref into the live packet and exactly one may unref it, and until now
-// eleven functions across the pipeline did both.
+// object may av_packet_move_ref into the live packet and exactly one may unref it.
 //
 // The packet's lifecycle. getPacket() hands out the live packet by reference; whoever holds it may
 // read it and must then either holdPacketForRetry() (the decoder refused it with EAGAIN and it
@@ -46,14 +45,11 @@ public:
     // Allocates the live packet and the parking slot. Runs after every MediaSource open and
     // re-open, because both belong to the run over one container.
     //
-    // It does *not* clear the replay buffer, and that is deliberate rather than an oversight — the
-    // pipeline did not clear it here before this type existed either. What makes a buffer surviving
-    // a re-open harmless is that reopen() does not reset the decode position, and every path that
-    // re-opens reaches readLanding() next, whose first act is clearGopBuffer(). So nothing ever
-    // replays packets read from the container that was closed. Clearing it here would be tighter,
-    // now that one type owns the buffer, but it would change behaviour on a path nothing currently
-    // reaches, and this revision does not fix latent hazards inside a restructuring step. It is in
-    // the note to the reviewer instead.
+    // It does *not* clear the replay buffer. What makes a buffer surviving a re-open harmless is
+    // that every path that re-opens reaches readLanding() next, whose first act is clearGopBuffer(),
+    // so nothing ever replays packets read from the container that was closed. Clearing it here
+    // would be tighter but would change behaviour on a path nothing currently reaches; it is left
+    // as is on purpose, and this comment is the record of that.
     [[nodiscard]] std::expected<void, Error> attach()
     {
         auto p = makePacket();

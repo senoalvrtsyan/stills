@@ -26,6 +26,18 @@ TEST_CASE ("Time: construction and chrono conversion are exact", "[time]")
     REQUIRE (Time::fromDuration (2min) == Time{ 120, 1 });
 }
 
+// A non-positive timescale yields an invalid Time whose stored fields are normalised to 0/1, so the
+// raw input never leaks through getValue()/getTimescale() and every invalid Time looks the same.
+TEST_CASE ("Time: an invalid construction is normalised, not stored as given", "[time]")
+{
+    STATIC_REQUIRE (Time{ 5, 0 }.getValue() == 0);
+    STATIC_REQUIRE (Time{ 5, 0 }.getTimescale() == 1);
+    STATIC_REQUIRE (Time{ 7, -3 }.getValue() == 0);
+    STATIC_REQUIRE (Time{ 7, -3 }.getTimescale() == 1);
+    STATIC_REQUIRE (Time{ 7, -3 }.getValue() == Time::invalid().getValue());
+    STATIC_REQUIRE (Time{ 7, -3 }.getTimescale() == Time::invalid().getTimescale());
+}
+
 TEST_CASE ("Time: arithmetic and ordering", "[time]")
 {
     STATIC_REQUIRE (Time{ 1, 3 } + Time{ 1, 6 } == Time{ 1, 2 });

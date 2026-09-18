@@ -213,7 +213,16 @@ TEST_CASE ("options: untrusted sources are confined to the file protocol", "[opt
 
     SECTION ("a real key that this source does not use is accepted")
     {
-        // HTTP options are real libavformat keys; a local path consumes none of them.
+        // HTTP options are real libavformat keys; a local path consumes none of them. `reconnect`
+        // is defined by the http protocol alone, so an FFmpeg built without it rejects the key as
+        // unknown, which is correct and not what this section tests.
+        bool hasHttp = false;
+        void* it = nullptr;
+
+        while (const char* name = avio_enum_protocols (&it, 0))
+            if (std::string_view{ name } == "http") hasHttp = true;
+
+        if (! hasHttp) SKIP ("this FFmpeg build has no http protocol");
         Options http = swOptions();
         http.demuxerOptions = { { "reconnect", "1" }, { "rw_timeout", "10000000" } };
         auto g = stills::AssetImageGenerator::open (clip, http);

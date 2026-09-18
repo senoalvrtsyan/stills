@@ -9,7 +9,6 @@
 //
 // The invariant the type exists for: `valid` cannot be written on its own. A slot becomes valid
 // only by adopting a frame and invalid only by clear(), so the flag and the frame cannot disagree.
-// Before this, the flags were set by hand in five places and agreed only by inspection.
 //
 // Precondition on every member but install(): the slot has been given its AVFrame.
 // FramePipeline::attachToSource() gives all three theirs before anything else can reach them and

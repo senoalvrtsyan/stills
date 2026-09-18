@@ -282,7 +282,7 @@ public:
     // HardwarePolicy::automatic as it stands: a lookup made once at open(), with no measurement
     // behind it. HEVC/AV1/VP9/VVC at 720p and up go to hardware, everything else to software.
     //
-    // The rule is wrong, and the note to the reviewer says so rather than defending it. It was
+    // The rule is known to be wrong in both directions. It was
     // fitted to one machine's NVDEC pathology: the h264 decoder renegotiates its pixel format after
     // every avcodec_flush_buffers() — once per seek, and seeking is this library's core operation —
     // and NVDEC rebuilds its CUVID decoder each time, which made software 4.7x faster there.
@@ -305,8 +305,7 @@ public:
     // table as an initial guess only, then one A/B on real content per (codec, resolution class,
     // device type) per process, the winner cached and the numbers reported in
     // ActiveDecoder::fallbackReason — is written up in the README under "What `automatic` should
-    // be". Deliberately not implemented here: the review asked for structure, standards and fixes,
-    // and an adaptive policy is a feature.
+    // be". Deliberately not implemented here: an adaptive policy is a feature, not a fix.
     //
     // A renegotiation counter still earns a place, as a diagnostic on ActiveDecoder: it is what
     // explains a bad hardware number to whoever reads the log. Not as the decision input.

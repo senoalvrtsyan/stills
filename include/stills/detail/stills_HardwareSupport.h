@@ -173,10 +173,12 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
 
     if (out.empty())
     {
-        reason = wanted != AV_HWDEVICE_TYPE_NONE
-                     ? std::string{ "decoder '" } + codec->name + "' does not support device type '"
-                           + av_hwdevice_get_type_name (wanted) + "'"
-                     : std::string{ "decoder '" } + codec->name + "' has no hardware device configurations";
+        reason = std::string{ "decoder '" } + codec->name;
+
+        if (wanted != AV_HWDEVICE_TYPE_NONE)
+            reason += std::string{ "' does not support device type '" } + av_hwdevice_get_type_name (wanted) + "'";
+        else
+            reason += "' has no hardware device configurations";
         return out;
     }
 

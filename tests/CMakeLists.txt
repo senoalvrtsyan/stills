@@ -104,6 +104,28 @@ stills_apply_warnings(stills_odr)
 add_dependencies(stills_odr stills_fixtures)
 add_test(NAME stills.odr COMMAND stills_odr)
 
+# ---- the re-open fallback for an unverified libavformat major ---------------------------------
+# MediaSource::tryResetIoState() clears libavio's sticky state in place only on the majors it was
+# verified against; on any other it returns false and the pipeline re-opens the source instead. No
+# FFmpeg in the verified range can reach that branch, so this binary compiles the cancellation tests
+# with STILLS_FORCE_UNVERIFIED_LIBAVFORMAT defined, which forces every major down it. The cases that
+# must still pass are the seekable-file ones: a cancelled request followed by a live one, and a
+# cancelled batch followed by a usable generator. The pipe case is excluded on purpose -- a pipe
+# cannot be re-opened, so on an unverified major the interrupted read stays failed, which is the
+# documented outcome (README, "Build and test") rather than a defect this build should hide.
+add_executable(stills_tests_reopen_fallback test_cancel_io.cpp)
+target_link_libraries(stills_tests_reopen_fallback PRIVATE stills::stills Catch2::Catch2WithMain)
+target_include_directories(stills_tests_reopen_fallback PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(stills_tests_reopen_fallback PRIVATE
+  STILLS_FIXTURE_DIR="${STILLS_FIXTURE_DIR}"
+  STILLS_FORCE_UNVERIFIED_LIBAVFORMAT=1)
+stills_apply_warnings(stills_tests_reopen_fallback)
+add_dependencies(stills_tests_reopen_fallback stills_fixtures)
+catch_discover_tests(stills_tests_reopen_fallback
+  TEST_PREFIX "stills.reopenFallback."
+  TEST_SPEC "~[pipe]"
+  DISCOVERY_MODE PRE_TEST)
+
 # ---- build-time check: the value headers compile without FFmpeg -------------------------------
 # Seven headers must reach no libav header so they can appear in a consumer's own public headers
 # (README, "Design decisions"). This target deliberately does *not* link stills::stills: that would

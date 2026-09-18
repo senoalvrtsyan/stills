@@ -174,10 +174,13 @@ public:
     explicit constexpr Time (std::int64_t value, std::int32_t timescale) noexcept
       : value (value), timescale (timescale), kind (timescale > 0 ? Kind::finite : Kind::invalid)
     {
+        // The parameters shadow the members they initialise, so the members are named explicitly:
+        // written bare, these two lines would assign the parameters and leave an invalid Time
+        // carrying its raw input.
         if (kind == Kind::invalid)
         {
-            value = 0;
-            timescale = 1;
+            this->value = 0;
+            this->timescale = 1;
         }
     }
 
