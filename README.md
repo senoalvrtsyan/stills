@@ -175,8 +175,8 @@ reference for every knob, including when you would want it.
 
 | | |
 |---|---|
-| Compiler | C++23 with `std::expected` and `__int128`: GCC 13+, Clang 17+ with libc++ 16+, Xcode 15+. **MSVC is not supported.** |
-| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Built and the full suite run here against **6.1** (libavformat 60), **7.1.2** (61), **8.0** (62) and **9.0.1** (63) — every test passing on each, hardware decode included (the suite had 121 tests at the time of those runs; the count since has grown with the tests listed below). One recovery path — clearing libavio's sticky error state after a cancelled read — pokes `AVIOContext` fields directly and is enabled only for those four majors; on any other it is skipped and a rewindable source is re-opened instead, costing one extra re-open per interrupt recovery rather than failing the build. On a non-rewindable source (a pipe) there is nothing to re-open and the interrupted read still fails — the same outcome as before, minus the build failure. |
+| Compiler | C++23 with `std::expected` and `__int128`: GCC 13+, Clang 17+ with libc++ 16+, Xcode 15+. **MSVC is not supported.** Built and the suite run here with GCC 13.3 and with Clang 18 on libc++ 18 (`-stdlib=libc++`), both under the full warning set as errors. The `std::formatter` specialisations are gated on `STILLS_HAS_FORMAT` (detail/stills_Config.h), which is true where `__cpp_lib_format` is defined and on libc++ 17 or newer, whose `<format>` is usable before the feature-test macro is defined. |
+| FFmpeg | 6.1 or newer (`static_assert`ed), found through `pkg-config`. Verified from FFmpeg **6.1** (libavformat 60) through **9.0.1** (libavformat 63): built and the full suite run against 6.1, 7.1.2, 8.0 and 9.0.1, hardware decode included. One recovery path — clearing libavio's sticky error state after a cancelled read — pokes `AVIOContext` fields directly and is enabled only for those four majors; on any other it is skipped and a rewindable source is re-opened instead, costing one extra re-open per interrupt recovery rather than failing the build. On a non-rewindable source (a pipe) there is nothing to re-open and the interrupted read still fails — the same outcome as before, minus the build failure. |
 | Build | CMake ≥ 3.25 and `Threads`. **Every preset specifies the Ninja generator**, so install `ninja` or configure by hand with `-G`. Catch2 v3.16.0 is fetched at configure time unless `find_package(Catch2 3)` finds one. |
 | Standard | A top-level build pins `CMAKE_CXX_STANDARD 23`, `..._REQUIRED ON`, `..._EXTENSIONS OFF`, and sets `CXX_STANDARD 23` on the fetched Catch2 targets. CMake otherwise leaves Catch2 (`cxx_std_14`) at the compiler's default, and a standard mismatch makes our C++23 test TUs reference `StringMaker` specialisations Catch2 never emitted — the reported Apple Clang 17 link failure. Reproduced here only at C++14-vs-C++23; at C++17-vs-C++23 the symbol surface is identical on libstdc++, so **the Apple Clang mechanism itself is unverified — there is no Apple toolchain on this machine.** A consumer's settings are untouched. |
 | Fixtures | An `ffmpeg` **binary** (6.0+, for `-display_rotation` and `-fps_mode`) with `libx264`, and `python3` for one clip — which falls back to `tr` when absent. `libvpx-vp9` and `libx265` are optional; their tests skip themselves. |
@@ -207,7 +207,7 @@ libavcodec's own thread pool; `stills.hw` is excluded because TSan aborts inside
 > `ASAN_OPTIONS=detect_leaks=1`, which is the default on Linux but is not supported on every
 > Darwin target — drop that one variable if the preset refuses to start on macOS.
 
-`ctest` runs 136 tests: 133 Catch2 cases in `stills_tests`, two more in `stills_tests_reopen_fallback`
+`ctest` runs 145 tests: 142 Catch2 cases in `stills_tests`, two more in `stills_tests_reopen_fallback`
 (the cancellation tests compiled with `STILLS_FORCE_UNVERIFIED_LIBAVFORMAT`, so the re-open fallback
 for a libavformat major outside the verified range is exercised on every FFmpeg), plus one ODR
 executable of three translation units, which is what makes "header-only" a checked claim rather than
@@ -218,6 +218,10 @@ entirely — they report nothing either way.
 Warnings are errors for the library's own targets (`-Wall -Wextra -Wpedantic -Wshadow -Wconversion
 -Wsign-conversion -Wold-style-cast …`; `-DSTILLS_WERROR=OFF` relaxes it), and nothing is imposed on
 consumers: `stills::stills` carries only the include directory, C++23 and the link dependencies.
+Because every target sees the headers through `-isystem`, one object target
+(`stills_header_warnings`) compiles every public header through a plain `-I` under the same set plus
+GCC's `-Wuseless-cast`, so a warning in the library's own code fails the build rather than a
+consumer's.
 
 **Using it in your project.** Three routes to the same target:
 
@@ -416,7 +420,7 @@ stills::AssetImageGenerator (move-only handle) ──shared_ptr──▶ detail:
 
 ### Structure
 
-The decode machinery is seven types plus four value types, all in `stills::detail`, all header-only,
+The decode machinery is seven types plus five value types, all in `stills::detail`, all header-only,
 one principal type per header:
 
 | Header | Owns |
@@ -427,12 +431,16 @@ one principal type per header:
 | `detail/stills_VideoDecoder.h` | the `AVCodecContext`, the hardware device and session, send/receive/flush/drain, the skip policy, the `ActiveDecoder` snapshot |
 | `detail/stills_Positioner.h` | every decision about where to send the demuxer — and none of the sending |
 | `detail/stills_FrameSelector.h` | the decode loop, the held and look-ahead frames, the `DecodeFrontier`, the per-request mode and skip window, end-of-stream policy, the nearest-keyframe tail check — and none of the seeking |
-| `detail/stills_FramePipeline.h` | orchestration: request validation, the hardware-fault ladder, positioning as an action (seek, re-open, back-off, landing), `AssetInfo`, conversion |
+| `detail/stills_FramePipeline.h` | orchestration: the hardware-fault ladder and the decoder ladder at open, positioning as an action (seek, re-open, back-off, landing), conversion |
+| `detail/stills_RequestWindow.h` | a request mapped into the stream's timestamp domain: target, tolerance window, bounds adjustment and mode. Pure arithmetic, unit-tested without a file |
+| `detail/stills_AssetInfoBuilder.h` | `makeAssetInfo()`: the `AssetInfo` a generator reports, assembled from the source, the decoder and the probe frame |
 
 The values they pass around are `FrameSlot` (one owned frame together with `valid` and `concealed`,
 as one thing), `DecodeFrontier` (how far the decoder has got and what it never produced, including
-`SkippedFrames`), `Position` (where the demuxer was put and what that landing is known to be) and
-`SeekCostModel` (what a seek costs and what a frame costs, measured).
+`SkippedFrames`), `Position` (where the demuxer was put and what that landing is known to be),
+`RequestWindow` (what a request asks for, in stream ticks, so that one value travels through
+selection instead of a target, two edges and an adjustment) and `SeekCostModel` (what a seek costs
+and what a frame costs, measured).
 
 **Why the cut is there.** The obvious split — input and decoder setup, positioning and the keyframe
 index, decoding and frame selection — does not survive contact with the state. Those three jobs
@@ -637,15 +645,8 @@ a handle does not cancel. Handlers must not throw, as with any `std::thread`.
   the libav headers and ~1,000 of their macros, 52 unprefixed (`MKTAG`, `M_PI`, `NAN`, …) — the
   value headers are FFmpeg-free so they can appear in yours instead. These headers are exported as
   `SYSTEM INTERFACE`, so your build sees them through `-isystem` and your warnings do not apply to
-  them. If you put them on a plain `-I` path and enable `-Wshadow`, expect ~47 reports from 17
-  sites: constructor parameters that share a name with the member they initialise
-  (`Time (std::int64_t value, ...) : value (value)`), which is what dropping trailing member
-  underscores costs. Sixteen are constructors whose body is empty, so the parameter is the only thing
-  in scope to name; `Converter::pooledFrame` shadows a member of a *different* type (`AVPixelFormat`
-  parameter over a `PixelFormat` member), so confusing the two would not compile. The one constructor
-  with a body, `Time (value, timescale)`, names its members as `this->value` / `this->timescale`
-  where it assigns them, and `tests/test_time.cpp` pins that an invalid `Time` is normalised to 0/1 —
-  that assignment is exactly the site where a bare name would silently bind to the parameter. A plugin embedding stills also
+  them; on a plain `-I` path they are clean under the warning set listed above, which the
+  `stills_header_warnings` target checks on every build. A plugin embedding stills also
   cannot be unloaded: GCC gives its function-local statics `STB_GNU_UNIQUE` binding and glibc marks
   such objects `NODELETE`, so build one with `-fno-gnu-unique` if it must `dlclose()`.
 - Exceptions are used internally though none crosses the API, so `-fno-exceptions` is unsupported

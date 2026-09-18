@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "ppm.hpp"
+#include "stills_Ppm.h"
 
 namespace
 {

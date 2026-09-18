@@ -75,7 +75,7 @@ namespace stills::detail
 {
 
 // libav constants that are C-cast macros, as typed values.
-namespace k
+namespace libav
 {
 inline constexpr std::int64_t noPts = AV_NOPTS_VALUE;
 inline constexpr int eof = AVERROR_EOF;
@@ -88,34 +88,34 @@ inline constexpr int decoderNotFound = AVERROR_DECODER_NOT_FOUND;
 inline constexpr int streamNotFound = AVERROR_STREAM_NOT_FOUND;
 inline constexpr int exitRequested = AVERROR_EXIT;
 inline constexpr AVRational timeBaseQ{ 1, AV_TIME_BASE };
-} // namespace k
+} // namespace libav
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
 
-static_assert (k::noPts == std::numeric_limits<std::int64_t>::min());
+static_assert (libav::noPts == std::numeric_limits<std::int64_t>::min());
 
 // Deleter for libav allocations. Handles both `void f(T**)` (avformat_close_input,
 // avcodec_free_context, av_frame_free, ...) and `void f(T*)` (sws_freeContext) shapes.
-template <auto Fn>
+template <auto FreeFunction>
 struct AvDeleter
 {
-    template <class T>
-    void operator() (T* p) const noexcept
+    template <class Pointee>
+    void operator() (Pointee* pointer) const noexcept
     {
-        if constexpr (std::is_invocable_v<decltype (Fn), T**>)
+        if constexpr (std::is_invocable_v<decltype (FreeFunction), Pointee**>)
         {
-            Fn (&p); // libav nulls our local copy; unique_ptr has already relinquished ownership
+            FreeFunction (&pointer); // libav nulls our local copy; unique_ptr has already relinquished ownership
         }
         else
         {
-            Fn (p);
+            FreeFunction (pointer);
         }
     }
 };
 
-template <class T, auto Fn>
-using avPtr = std::unique_ptr<T, AvDeleter<Fn>>;
+template <class Pointee, auto FreeFunction>
+using avPtr = std::unique_ptr<Pointee, AvDeleter<FreeFunction>>;
 
 using FormatCtxPtr = avPtr<AVFormatContext, avformat_close_input>;
 using CodecCtxPtr = avPtr<AVCodecContext, avcodec_free_context>;
@@ -125,24 +125,24 @@ using BufferRefPtr = avPtr<AVBufferRef, av_buffer_unref>;
 using SwsCtxPtr = avPtr<SwsContext, sws_freeContext>;
 using DictPtr = avPtr<AVDictionary, av_dict_free>;
 
-[[nodiscard]] inline std::string avErrorString (int err)
+[[nodiscard]] inline std::string avErrorString (int avError)
 {
-    char buf[AV_ERROR_MAX_STRING_SIZE]{};
+    char text[AV_ERROR_MAX_STRING_SIZE]{};
 
-    if (av_strerror (err, buf, sizeof buf) < 0) return "unknown error " + std::to_string (err);
-    return std::string{ buf };
+    if (av_strerror (avError, text, sizeof text) < 0) return "unknown error " + std::to_string (avError);
+    return std::string{ text };
 }
 
 // Builds an Error from a libav return value with context ("avformat_open_input(\"x.mp4\")").
-[[nodiscard]] inline Error makeError (ErrorCode code, int avErr, std::string context)
+[[nodiscard]] inline Error makeError (ErrorCode code, int avError, std::string context)
 {
-    if (avErr < 0)
+    if (avError < 0)
     {
         context += ": ";
-        context += avErrorString (avErr);
+        context += avErrorString (avError);
     }
 
-    return Error{ code, avErr < 0 ? avErr : 0, std::move (context) };
+    return Error{ code, avError < 0 ? avError : 0, std::move (context) };
 }
 
 [[nodiscard]] inline Error makeError (ErrorCode code, std::string message)
@@ -150,9 +150,9 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     return Error{ code, 0, std::move (message) };
 }
 
-[[nodiscard]] inline std::unexpected<Error> fail (ErrorCode code, int avErr, std::string context)
+[[nodiscard]] inline std::unexpected<Error> fail (ErrorCode code, int avError, std::string context)
 {
-    return std::unexpected (makeError (code, avErr, std::move (context)));
+    return std::unexpected (makeError (code, avError, std::move (context)));
 }
 
 [[nodiscard]] inline std::unexpected<Error> fail (ErrorCode code, std::string message)
@@ -161,28 +161,28 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
 }
 
 // Maps a generic libav return code to the closest ErrorCode when no better context exists.
-[[nodiscard]] inline ErrorCode classify (int avErr, ErrorCode fallback) noexcept
+[[nodiscard]] inline ErrorCode classify (int avError, ErrorCode fallback) noexcept
 {
-    if (avErr == k::enomem) return ErrorCode::outOfMemory;
-    if (avErr == k::enoent) return ErrorCode::fileNotFound;
-    if (avErr == k::decoderNotFound) return ErrorCode::decoderNotFound;
-    if (avErr == k::streamNotFound) return ErrorCode::noVideoStream;
+    if (avError == libav::enomem) return ErrorCode::outOfMemory;
+    if (avError == libav::enoent) return ErrorCode::fileNotFound;
+    if (avError == libav::decoderNotFound) return ErrorCode::decoderNotFound;
+    if (avError == libav::streamNotFound) return ErrorCode::noVideoStream;
     return fallback;
 }
 
-[[nodiscard]] constexpr AVRational toAv (Rational r) noexcept
+[[nodiscard]] constexpr AVRational toAv (Rational rational) noexcept
 {
-    return AVRational{ r.num, r.den };
+    return AVRational{ rational.num, rational.den };
 }
 
-[[nodiscard]] constexpr Rational fromAv (AVRational r) noexcept
+[[nodiscard]] constexpr Rational fromAv (AVRational rational) noexcept
 {
-    return Rational{ r.num, r.den };
+    return Rational{ rational.num, rational.den };
 }
 
-[[nodiscard]] constexpr AVPixelFormat toAv (PixelFormat f) noexcept
+[[nodiscard]] constexpr AVPixelFormat toAv (PixelFormat format) noexcept
 {
-    switch (f)
+    switch (format)
     {
     case PixelFormat::rgba:
         return AV_PIX_FMT_RGBA;
@@ -215,9 +215,9 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     return AV_PIX_FMT_NONE;
 }
 
-[[nodiscard]] constexpr std::optional<PixelFormat> fromAv (AVPixelFormat f) noexcept
+[[nodiscard]] constexpr std::optional<PixelFormat> fromAv (AVPixelFormat format) noexcept
 {
-    switch (f)
+    switch (format)
     {
     case AV_PIX_FMT_RGBA:
         return PixelFormat::rgba;
@@ -250,9 +250,9 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
     }
 }
 
-[[nodiscard]] constexpr ColorRange fromAv (AVColorRange r) noexcept
+[[nodiscard]] constexpr ColorRange fromAv (AVColorRange range) noexcept
 {
-    switch (r)
+    switch (range)
     {
     case AVCOL_RANGE_MPEG:
         return ColorRange::limited;
@@ -264,17 +264,17 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
 }
 
 // Resolves our device enum to libav's at runtime by name; NONE if this build lacks the type.
-[[nodiscard]] inline AVHWDeviceType toAv (HardwareDeviceType t) noexcept
+[[nodiscard]] inline AVHWDeviceType toAv (HardwareDeviceType type) noexcept
 {
-    return av_hwdevice_find_type_by_name (std::string{ toString (t) }.c_str());
+    return av_hwdevice_find_type_by_name (std::string{ toString (type) }.c_str());
 }
 
-[[nodiscard]] inline std::optional<HardwareDeviceType> fromAv (AVHWDeviceType t) noexcept
+[[nodiscard]] inline std::optional<HardwareDeviceType> fromAv (AVHWDeviceType type) noexcept
 {
-    const char* name = av_hwdevice_get_type_name (t);
+    const char* name = av_hwdevice_get_type_name (type);
 
     if (name == nullptr) return std::nullopt;
-    const std::string_view n{ name };
+    const std::string_view nameView{ name };
     constexpr HardwareDeviceType all[] = { HardwareDeviceType::cuda,         HardwareDeviceType::vaapi,
                                            HardwareDeviceType::videotoolbox, HardwareDeviceType::d3d11va,
                                            HardwareDeviceType::dxva2,        HardwareDeviceType::qsv,
@@ -284,15 +284,15 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
 
     for (auto h : all)
     {
-        if (toString (h) == n) return h;
+        if (toString (h) == nameView) return h;
     }
 
     return std::nullopt;
 }
 
-[[nodiscard]] constexpr int toSwsFlags (Scaler s) noexcept
+[[nodiscard]] constexpr int toSwsFlags (Scaler scaler) noexcept
 {
-    switch (s)
+    switch (scaler)
     {
     case Scaler::fastBilinear:
         return SWS_FAST_BILINEAR;
@@ -312,18 +312,18 @@ using DictPtr = avPtr<AVDictionary, av_dict_free>;
 // Allocation helpers returning expected so callers never see a null libav pointer.
 [[nodiscard]] inline std::expected<FramePtr, Error> makeFrame()
 {
-    FramePtr f{ av_frame_alloc() };
+    FramePtr frame{ av_frame_alloc() };
 
-    if (! f) return fail (ErrorCode::outOfMemory, "av_frame_alloc");
-    return f;
+    if (! frame) return fail (ErrorCode::outOfMemory, "av_frame_alloc");
+    return frame;
 }
 
 [[nodiscard]] inline std::expected<PacketPtr, Error> makePacket()
 {
-    PacketPtr p{ av_packet_alloc() };
+    PacketPtr packet{ av_packet_alloc() };
 
-    if (! p) return fail (ErrorCode::outOfMemory, "av_packet_alloc");
-    return p;
+    if (! packet) return fail (ErrorCode::outOfMemory, "av_packet_alloc");
+    return packet;
 }
 
 } // namespace stills::detail

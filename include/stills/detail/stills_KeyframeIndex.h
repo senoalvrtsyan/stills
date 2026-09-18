@@ -10,10 +10,9 @@
 //
 // It does not read packets, does not seek and does not decide anything: positioning asks it where
 // keyframes are and makes its own choices. The container's own index is reached through a
-// ContainerIndex passed per call rather than a reference held as a member, for the reason the
-// frontier is passed per call to the positioner — a re-open replaces the AVFormatContext and the
-// AVStream underneath, and nothing here may outlive them. That is also what makes this the one
-// type in the split with direct unit tests: the recorded-index half needs no container at all.
+// ContainerIndex passed per call rather than a reference held as a member, because a re-open
+// replaces the AVFormatContext and the AVStream underneath. That is also what lets the
+// recorded-index half be unit-tested with no container at all (tests/test_keyframe_index.cpp).
 //
 // Timestamp domains, the thing to get right here. Recorded entries are keyed by *presentation*
 // time. libavformat's mov index is in the *decode* domain, so a query against it is shifted by
@@ -44,7 +43,7 @@ struct KeyEntry
     std::int64_t pts;
     std::int64_t dts;
     std::int64_t pos;
-    std::int64_t nextPts; // k::noPts = unknown; INT64_MAX = the stream ended inside this GOP
+    std::int64_t nextPts; // libav::noPts = unknown; INT64_MAX = the stream ended inside this GOP
 };
 
 // What a KeyframeIndex query needs from the container it is asked about: libavformat's own index
@@ -67,80 +66,81 @@ public:
     // Learns the stream's reorder delay (a keyframe's pts - dts; the smallest seen, so open-GOP CRAs
     // with leading pictures do not inflate it) and remembers the stream position of every keyframe
     // packet on containers without a trusted index.
-    void notePacket (const AVPacket& p, const ContainerIndex& container)
+    void notePacket (const AVPacket& packet, const ContainerIndex& container)
     {
-        const bool key = (p.flags & AV_PKT_FLAG_KEY) != 0;
+        const bool isKey = (packet.flags & AV_PKT_FLAG_KEY) != 0;
 
-        if (! key) return;
-        if (p.pts != k::noPts && p.dts != k::noPts && p.pts >= p.dts)
+        if (! isKey) return;
+        if (packet.pts != libav::noPts && packet.dts != libav::noPts && packet.pts >= packet.dts)
         {
-            const std::int64_t d = p.pts - p.dts;
-            reorderTicks = reorderKnown ? std::min (reorderTicks, d) : d;
+            const std::int64_t delay = packet.pts - packet.dts;
+            reorderTicks = reorderKnown ? std::min (reorderTicks, delay) : delay;
             reorderKnown = true;
             keysHaveDts = true;
         }
 
-        recordKey (p.pts, p.dts, p.pos, container);
+        recordKey (packet.pts, packet.dts, packet.pos, container);
     }
 
     // Records a keyframe packet; links it to the previous keyframe when the packets in between were
     // read contiguously (so that keyframe's GOP extent becomes known).
     void recordKey (std::int64_t pts, std::int64_t dts, std::int64_t pos, const ContainerIndex& container)
     {
-        if (pts == k::noPts || pos < 0 || container.trusted) return;
-        std::size_t i = lowerBound (pts);
+        if (pts == libav::noPts || pos < 0 || container.trusted) return;
+        std::size_t index = lowerBound (pts);
 
-        if (i < entries.size() && entries[i].pts == pts)
+        if (index < entries.size() && entries[index].pts == pts)
         {
-            entries[i].dts = dts;
-            entries[i].pos = pos;
+            entries[index].dts = dts;
+            entries[index].pos = pos;
         }
         else
         {
             if (entries.size() >= maxKeyEntries) return;
-            entries.insert (entries.begin() + static_cast<std::ptrdiff_t> (i), KeyEntry{ pts, dts, pos, k::noPts });
+            entries.insert (entries.begin() + static_cast<std::ptrdiff_t> (index),
+                            KeyEntry{ pts, dts, pos, libav::noPts });
 
-            if (contigKey != noEntry && contigKey >= i) ++contigKey;
+            if (contiguousKey != noEntry && contiguousKey >= index) ++contiguousKey;
         }
 
-        if (contigKey != noEntry && contigKey < entries.size() && entries[contigKey].pts < pts)
+        if (contiguousKey != noEntry && contiguousKey < entries.size() && entries[contiguousKey].pts < pts)
         {
-            entries[contigKey].nextPts = pts;
-            noteKeyframeSpan (entries[contigKey].pts, pts);
+            entries[contiguousKey].nextPts = pts;
+            noteKeyframeSpan (entries[contiguousKey].pts, pts);
         }
 
-        contigKey = i;
+        contiguousKey = index;
     }
 
     // The packets after the last recorded keyframe are no longer being read contiguously (the
     // demuxer moved), so the next keyframe recorded says nothing about that one's extent.
-    void resetContiguity() noexcept { contigKey = noEntry; }
+    void resetContiguity() noexcept { contiguousKey = noEntry; }
 
-    // The recorded keyframe whose GOP is known to contain P, or nullptr.
-    [[nodiscard]] const KeyEntry* findCoveringKey (std::int64_t P) const noexcept
+    // The recorded keyframe whose GOP is known to contain target, or nullptr.
+    [[nodiscard]] const KeyEntry* findCoveringKey (std::int64_t target) const noexcept
     {
         if (entries.empty()) return nullptr;
-        std::size_t i = lowerBound (P);
+        std::size_t index = lowerBound (target);
 
-        if (i == entries.size() || entries[i].pts != P)
+        if (index == entries.size() || entries[index].pts != target)
         {
-            if (i == 0) return nullptr;
-            --i;
+            if (index == 0) return nullptr;
+            --index;
         }
 
-        const KeyEntry& e = entries[i];
+        const KeyEntry& entry = entries[index];
 
-        if (e.pts > P || e.nextPts == k::noPts || P >= e.nextPts) return nullptr;
-        return &e;
+        if (entry.pts > target || entry.nextPts == libav::noPts || target >= entry.nextPts) return nullptr;
+        return &entry;
     }
 
     // The recorded entry for exactly this keyframe, or nullptr. Unlike findCoveringKey() this asks
     // nothing about the GOP's extent: the caller has the keyframe and wants its byte position.
     [[nodiscard]] const KeyEntry* findEntry (std::int64_t keyPts) const noexcept
     {
-        const std::size_t i = lowerBound (keyPts);
+        const std::size_t index = lowerBound (keyPts);
 
-        if (i < entries.size() && entries[i].pts == keyPts) return &entries[i];
+        if (index < entries.size() && entries[index].pts == keyPts) return &entries[index];
         return nullptr;
     }
 
@@ -148,38 +148,41 @@ public:
     // past anything that can be asked for. A no-op when that keyframe was never recorded.
     void noteStreamEndedInGop (std::int64_t keyPts) noexcept
     {
-        const std::size_t i = lowerBound (keyPts);
+        const std::size_t index = lowerBound (keyPts);
 
-        if (i < entries.size() && entries[i].pts == keyPts)
-            entries[i].nextPts = std::numeric_limits<std::int64_t>::max();
+        if (index < entries.size() && entries[index].pts == keyPts)
+            entries[index].nextPts = std::numeric_limits<std::int64_t>::max();
     }
 
-    // The index entry of the keyframe at or before P on a container with a trusted index, or
-    // nullptr when the index does not cover P (a fragmented MP4 whose later fragments have not been
+    // The index entry of the keyframe at or before target on a container with a trusted index, or
+    // nullptr when the index does not cover target (a fragmented MP4 whose later fragments have not been
     // read yet). The mov index is in the DTS domain; `reorderTicks` (a keyframe's pts - dts,
-    // learned from the first keyframe packet) moves P there. Matroska cues are in the PTS domain and
+    // learned from the first keyframe packet) moves target there. Matroska cues are in the PTS domain and
     // its packets carry no DTS, so the shift is zero.
-    [[nodiscard]] const AVIndexEntry* getIndexKeyBefore (std::int64_t P, const ContainerIndex& container) const noexcept
+    [[nodiscard]] const AVIndexEntry* getIndexKeyBefore (std::int64_t target,
+                                                         const ContainerIndex& container) const noexcept
     {
-        const int n = avformat_index_get_entries_count (container.stream);
+        const int count = avformat_index_get_entries_count (container.stream);
 
-        if (n <= 0) return nullptr;
+        if (count <= 0) return nullptr;
         const std::int64_t shift = getIndexShift();
-        const std::int64_t ts = P > std::numeric_limits<std::int64_t>::min() + shift ? P - shift : P;
-        int e = av_index_search_timestamp (container.stream, ts, AVSEEK_FLAG_BACKWARD);
+        const std::int64_t shiftedTarget =
+            target > std::numeric_limits<std::int64_t>::min() + shift ? target - shift : target;
+        int position = av_index_search_timestamp (container.stream, shiftedTarget, AVSEEK_FLAG_BACKWARD);
 
-        if (e < 0) return nullptr;
-        if (e == n - 1)
+        if (position < 0) return nullptr;
+        if (position == count - 1)
         {
-            const AVIndexEntry* last = avformat_index_get_entry (container.stream, e);
+            const AVIndexEntry* lastEntry = avformat_index_get_entry (container.stream, position);
 
-            if (last == nullptr || ts > last->timestamp + std::max<std::int64_t> (2 * container.frameDurationHint, 1))
+            if (lastEntry == nullptr
+                || shiftedTarget > lastEntry->timestamp + std::max<std::int64_t> (2 * container.frameDurationHint, 1))
                 return nullptr;
         }
 
-        for (; e >= 0; --e)
+        for (; position >= 0; --position)
         {
-            const AVIndexEntry* entry = avformat_index_get_entry (container.stream, e);
+            const AVIndexEntry* entry = avformat_index_get_entry (container.stream, position);
 
             if (entry == nullptr) return nullptr;
             if ((entry->flags & AVINDEX_KEYFRAME) != 0) return entry;
@@ -188,38 +191,38 @@ public:
         return nullptr;
     }
 
-    // True when the container index records a keyframe in (keyPts, P], i.e. `keyPts` is probably
-    // not the keyframe covering P. The DTS index is shifted by the *smallest* reorder delay, so an
+    // True when the container index records a keyframe in (keyPts, target], i.e. `keyPts` is probably
+    // not the keyframe covering target. The DTS index is shifted by the *smallest* reorder delay, so an
     // open-GOP I-frame may be placed a frame early: a true result only makes the landing scan on.
-    [[nodiscard]] bool hasKeyBetween (std::int64_t keyPts, std::int64_t P,
+    [[nodiscard]] bool hasKeyBetween (std::int64_t keyPts, std::int64_t target,
                                       const ContainerIndex& container) const noexcept
     {
         if (! container.trusted) return false;
-        const AVIndexEntry* kf = getIndexKeyBefore (P, container);
+        const AVIndexEntry* keyframe = getIndexKeyBefore (target, container);
 
-        if (kf == nullptr) return false;
-        const std::int64_t kfPts = kf->timestamp + getIndexShift();
-        return kfPts > keyPts && kfPts <= P;
+        if (keyframe == nullptr) return false;
+        const std::int64_t kfPts = keyframe->timestamp + getIndexShift();
+        return kfPts > keyPts && kfPts <= target;
     }
 
-    // Whether `keyPts` is the keyframe at or before P with no other keyframe in between, known
+    // Whether `keyPts` is the keyframe at or before target with no other keyframe in between, known
     // from the container index (MP4/Matroska) or the recorded keyframe index (MPEG-TS).
-    [[nodiscard]] bool doesKeyCover (std::int64_t keyPts, std::int64_t P,
+    [[nodiscard]] bool doesKeyCover (std::int64_t keyPts, std::int64_t target,
                                      const ContainerIndex& container) const noexcept
     {
-        if (keyPts > P) return false;
+        if (keyPts > target) return false;
         if (container.trusted)
         {
-            const AVIndexEntry* kf = getIndexKeyBefore (P, container);
+            const AVIndexEntry* keyframe = getIndexKeyBefore (target, container);
 
-            if (kf == nullptr) return false;
+            if (keyframe == nullptr) return false;
             // mov indexes DTS (a keyframe's pts is its dts plus the reorder delay); Matroska cues are
             // PTS.
-            return kf->timestamp + getIndexShift() == keyPts;
+            return keyframe->timestamp + getIndexShift() == keyPts;
         }
 
-        const KeyEntry* e = findCoveringKey (P);
-        return e != nullptr && e->pts == keyPts;
+        const KeyEntry* entry = findCoveringKey (target);
+        return entry != nullptr && entry->pts == keyPts;
     }
 
     // Offset from the container index's timestamp domain to presentation time: the reorder delay
@@ -248,7 +251,7 @@ public:
     // span that is not longer than what is already known leaves the estimate alone.
     void noteKeyframeSpan (std::int64_t from, std::int64_t to) noexcept
     {
-        if (from == k::noPts || to == k::noPts || to <= from) return;
+        if (from == libav::noPts || to == libav::noPts || to <= from) return;
         gopHint = std::max (gopHint, to - from);
     }
 
@@ -258,27 +261,27 @@ private:
 
     [[nodiscard]] std::size_t lowerBound (std::int64_t pts) const noexcept
     {
-        std::size_t lo = 0, hi = entries.size();
+        std::size_t low = 0, high = entries.size();
 
-        while (lo < hi)
+        while (low < high)
         {
-            const std::size_t mid = lo + (hi - lo) / 2;
+            const std::size_t middle = low + (high - low) / 2;
 
-            if (entries[mid].pts < pts)
-                lo = mid + 1;
+            if (entries[middle].pts < pts)
+                low = middle + 1;
             else
-                hi = mid;
+                high = middle;
         }
 
-        return lo;
+        return low;
     }
 
-    std::vector<KeyEntry> entries;    // keyframe packets seen (containers without a trusted index)
-    std::size_t contigKey{ noEntry }; // entry of the last keyframe read without a seek since (its
-                                      // GOP extent grows)
-    std::int64_t gopHint{ 0 };        // largest keyframe spacing observed, in stream ticks
-    std::int64_t reorderTicks{ 0 };   // a keyframe's pts - dts (the B-frame reorder delay),
-                                      // smallest seen
+    std::vector<KeyEntry> entries;        // keyframe packets seen (containers without a trusted index)
+    std::size_t contiguousKey{ noEntry }; // entry of the last keyframe read without a seek since (its
+                                          // GOP extent grows)
+    std::int64_t gopHint{ 0 };            // largest keyframe spacing observed, in stream ticks
+    std::int64_t reorderTicks{ 0 };       // a keyframe's pts - dts (the B-frame reorder delay),
+                                          // smallest seen
     bool reorderKnown{ false };
     bool keysHaveDts{ false }; // keyframe packets carry a dts (mov); Matroska's do not
 };

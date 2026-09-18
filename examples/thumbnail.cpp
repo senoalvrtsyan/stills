@@ -5,7 +5,7 @@
 #include <stills/stills_Stills.h>
 #include <string>
 
-#include "ppm.hpp"
+#include "stills_Ppm.h"
 
 int main (int argc, char** argv)
 {

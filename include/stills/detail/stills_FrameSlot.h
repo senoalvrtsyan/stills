@@ -1,7 +1,7 @@
 #pragma once
 // stills/detail/stills_FrameSlot.h — one decoded frame together with the two flags that describe it.
 //
-// The pipeline keeps three: the frame it has chosen (held), the one frame of look-ahead that
+// FrameSelector keeps three: the frame it has chosen (held), the one frame of look-ahead that
 // proves the held frame covers the request (pending), and the last frame the decoder flagged
 // corrupt (a fallback for a stream that produces nothing better). Each owns an AVFrame that stays
 // allocated for the life of the pipeline and is unref'd rather than freed, so a slot can be empty
@@ -11,9 +11,8 @@
 // only by adopting a frame and invalid only by clear(), so the flag and the frame cannot disagree.
 //
 // Precondition on every member but install(): the slot has been given its AVFrame.
-// FramePipeline::attachToSource() gives all three theirs before anything else can reach them and
-// nothing takes one away, so this is a precondition the asserts name, not a case the members
-// branch on.
+// FrameSelector::attach() gives all three theirs before anything else can reach them and nothing
+// takes one away, so this is a precondition the asserts name, not a case the members branch on.
 //
 // Not thread-safe, and not meant to be: a FramePipeline is single-threaded by contract
 // (stills_FramePipeline.h), and a slot is only ever touched by the thread running that

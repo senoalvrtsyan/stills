@@ -1,7 +1,7 @@
 #include <limits>
 #include <sstream>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace testsupport;
 using stills::AssetImageGenerator;
@@ -67,7 +67,7 @@ TEST_CASE ("errors: Error rendering", "[errors]")
     std::ostringstream os;
     os << ErrorCode::noVideoStream;
     CHECK (os.str() == "noVideoStream");
-#if defined(__cpp_lib_format)
+#if STILLS_HAS_FORMAT
     CHECK (std::format ("{}", ErrorCode::decodeFailed) == "decodeFailed");
 #endif
 }

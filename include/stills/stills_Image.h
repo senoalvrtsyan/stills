@@ -220,10 +220,10 @@ public:
 private:
     friend struct detail::ImageAccess;
 
-    Image (detail::FramePtr frame, PixelFormat format, ColorRange range, Time actualTime, bool keyframe,
-           Adjustment adjustment, bool corrupt) noexcept
-      : frame (std::move (frame)), format (format), range (range), actualTime (actualTime), keyframe (keyframe),
-        adjustment (adjustment), corrupt (corrupt)
+    Image (detail::FramePtr pixels, PixelFormat pixelFormat, ColorRange colorRange, Time presentationTime, bool isKey,
+           Adjustment adjustmentMade, bool isConcealed) noexcept
+      : frame (std::move (pixels)), format (pixelFormat), range (colorRange), actualTime (presentationTime),
+        keyframe (isKey), adjustment (adjustmentMade), corrupt (isConcealed)
     {
     }
 
@@ -256,6 +256,6 @@ struct ImageAccess
 
 } // namespace stills
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 STILLS_DEFINE_ENUM_FORMATTER (stills::Adjustment);
 #endif

@@ -19,7 +19,7 @@
 
 #include "stills/detail/stills_Config.h"
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 #include <format>
 #endif
 
@@ -171,23 +171,20 @@ public:
     constexpr Time() noexcept = default;
 
     /// `value / timescale` seconds. A non-positive timescale yields an invalid Time.
-    explicit constexpr Time (std::int64_t value, std::int32_t timescale) noexcept
-      : value (value), timescale (timescale), kind (timescale > 0 ? Kind::finite : Kind::invalid)
+    explicit constexpr Time (std::int64_t ticks, std::int32_t ticksPerSecond) noexcept
+      : value (ticks), timescale (ticksPerSecond), kind (ticksPerSecond > 0 ? Kind::finite : Kind::invalid)
     {
-        // The parameters shadow the members they initialise, so the members are named explicitly:
-        // written bare, these two lines would assign the parameters and leave an invalid Time
-        // carrying its raw input.
         if (kind == Kind::invalid)
         {
-            this->value = 0;
-            this->timescale = 1;
+            value = 0;
+            timescale = 1;
         }
     }
 
     /// Implicit, lossless conversion from integral chrono durations whose period is 1/N seconds.
     template <std::integral Rep, class Period>
         requires (Period::num == 1 && Period::den <= std::numeric_limits<std::int32_t>::max())
-    constexpr Time (std::chrono::duration<Rep, Period> d) noexcept // NOLINT(google-explicit-constructor)
+    constexpr Time (std::chrono::duration<Rep, Period> d) noexcept
       : Time (static_cast<std::int64_t> (d.count()), static_cast<std::int32_t> (Period::den))
     {
     }
@@ -196,7 +193,7 @@ public:
     /// timeline is as likely to be written `2min` as `120s`. Overflow yields an invalid Time.
     template <std::integral Rep, class Period>
         requires (Period::den == 1 && Period::num > 1)
-    constexpr Time (std::chrono::duration<Rep, Period> d) noexcept // NOLINT(google-explicit-constructor)
+    constexpr Time (std::chrono::duration<Rep, Period> d) noexcept
       : Time (wholeSeconds (static_cast<std::int64_t> (d.count()), Period::num))
     {
     }
@@ -602,7 +599,7 @@ struct std::hash<stills::Time>
     [[nodiscard]] std::size_t operator() (stills::Time t) const noexcept { return t.hash(); }
 };
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 template <>
 struct std::formatter<stills::Time> : std::formatter<std::string>
 {

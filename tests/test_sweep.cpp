@@ -13,7 +13,7 @@
 #include <thread>
 #include <vector>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace testsupport;
 using stills::AssetImageGenerator;

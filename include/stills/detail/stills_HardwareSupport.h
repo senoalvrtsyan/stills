@@ -23,7 +23,7 @@ namespace stills::detail
 // address is stable for the codec context's lifetime.
 struct HwState
 {
-    AVPixelFormat hw_pix_fmt{ AV_PIX_FMT_NONE };
+    AVPixelFormat hardwarePixelFormat{ AV_PIX_FMT_NONE };
     bool gotHwFormat{ false }; // the decoder accepted our hardware format at least once
     bool declined{ false };    // the decoder offered no hardware format (profile unsupported)
     // The surface pool, allocated once and handed to the decoder again after every flush (the
@@ -37,71 +37,75 @@ struct HwState
 
 // Supplies the persistent pool to the decoder (allocating it on first use or after a geometry
 // change). Failure is not fatal: libavcodec allocates its own pool per negotiation as before.
-inline void hwSupplyFramesCtx (AVCodecContext* cc, HwState& st) noexcept
+inline void hwSupplyFramesCtx (AVCodecContext* context, HwState& state) noexcept
 {
-    if (cc->hw_device_ctx == nullptr) return;
-    const int w = cc->coded_width > 0 ? cc->coded_width : cc->width;
-    const int h = cc->coded_height > 0 ? cc->coded_height : cc->height;
+    if (context->hw_device_ctx == nullptr) return;
+    const int width = context->coded_width > 0 ? context->coded_width : context->width;
+    const int height = context->coded_height > 0 ? context->coded_height : context->height;
 
-    if (st.framesCtx && (st.framesWidth != w || st.framesHeight != h || st.framesSwFmt != cc->sw_pix_fmt))
-        st.framesCtx.reset();
+    if (state.framesCtx
+        && (state.framesWidth != width || state.framesHeight != height || state.framesSwFmt != context->sw_pix_fmt))
+        state.framesCtx.reset();
 
-    if (! st.framesCtx)
+    if (! state.framesCtx)
     {
-        AVBufferRef* ref = nullptr;
+        AVBufferRef* reference = nullptr;
 
-        if (avcodec_get_hw_frames_parameters (cc, cc->hw_device_ctx, st.hw_pix_fmt, &ref) < 0 || ref == nullptr) return;
-        auto* fc = reinterpret_cast<AVHWFramesContext*> (ref->data);
+        if (avcodec_get_hw_frames_parameters (context, context->hw_device_ctx, state.hardwarePixelFormat, &reference)
+                < 0
+            || reference == nullptr)
+            return;
+        auto* framesContext = reinterpret_cast<AVHWFramesContext*> (reference->data);
 
         // libavcodec's own ff_decode_get_hw_frames_ctx guarantees 4 base work surfaces on top of what
         // avcodec_get_hw_frames_parameters asks for (which guarantees 1): add the same 3.
-        if (fc->initial_pool_size > 0) fc->initial_pool_size += st.extraFrames + 3;
-        if (av_hwframe_ctx_init (ref) < 0)
+        if (framesContext->initial_pool_size > 0) framesContext->initial_pool_size += state.extraFrames + 3;
+        if (av_hwframe_ctx_init (reference) < 0)
         {
-            av_buffer_unref (&ref);
+            av_buffer_unref (&reference);
             return;
         }
 
-        st.framesCtx.reset (ref);
-        st.framesWidth = w;
-        st.framesHeight = h;
-        st.framesSwFmt = cc->sw_pix_fmt;
+        state.framesCtx.reset (reference);
+        state.framesWidth = width;
+        state.framesHeight = height;
+        state.framesSwFmt = context->sw_pix_fmt;
     }
 
-    if (cc->hw_frames_ctx == nullptr) cc->hw_frames_ctx = av_buffer_ref (st.framesCtx.get());
+    if (context->hw_frames_ctx == nullptr) context->hw_frames_ctx = av_buffer_ref (state.framesCtx.get());
 }
 
 // AVCodecContext::get_format callback: pick the negotiated hardware format if offered, else the
 // first software format (and remember that hardware was declined).
-inline AVPixelFormat hwGetFormat (AVCodecContext* cc, const AVPixelFormat* fmts) noexcept
+inline AVPixelFormat hwGetFormat (AVCodecContext* context, const AVPixelFormat* offered) noexcept
 {
-    auto* st = static_cast<HwState*> (cc->opaque);
+    auto* state = static_cast<HwState*> (context->opaque);
 
-    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p)
+    for (const AVPixelFormat* format = offered; *format != AV_PIX_FMT_NONE; ++format)
     {
-        if (st != nullptr && *p == st->hw_pix_fmt)
+        if (state != nullptr && *format == state->hardwarePixelFormat)
         {
-            st->gotHwFormat = true;
-            hwSupplyFramesCtx (cc, *st);
-            return *p;
+            state->gotHwFormat = true;
+            hwSupplyFramesCtx (context, *state);
+            return *format;
         }
     }
 
-    if (st != nullptr) st->declined = true;
-    for (const AVPixelFormat* p = fmts; *p != AV_PIX_FMT_NONE; ++p)
+    if (state != nullptr) state->declined = true;
+    for (const AVPixelFormat* format = offered; *format != AV_PIX_FMT_NONE; ++format)
     {
-        const auto* desc = av_pix_fmt_desc_get (*p);
+        const auto* descriptor = av_pix_fmt_desc_get (*format);
 
-        if (desc != nullptr && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0) return *p;
+        if (descriptor != nullptr && (descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL) == 0) return *format;
     }
 
-    return fmts[0];
+    return offered[0];
 }
 
 struct HwCandidate
 {
     AVHWDeviceType type{ AV_HWDEVICE_TYPE_NONE };
-    AVPixelFormat pix_fmt{ AV_PIX_FMT_NONE };
+    AVPixelFormat pixelFormat{ AV_PIX_FMT_NONE };
 };
 
 // Static preference order (first match wins), by device family. Anything not listed (or not known
@@ -118,14 +122,14 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
     HardwareDeviceType::drm,          HardwareDeviceType::mediacodec
 };
 
-[[nodiscard]] inline int hwRank (AVHWDeviceType t) noexcept
+[[nodiscard]] inline int hwRank (AVHWDeviceType type) noexcept
 {
-    const std::optional<HardwareDeviceType> ours = fromAv (t);
+    const std::optional<HardwareDeviceType> known = fromAv (type);
 
-    if (! ours) return static_cast<int> (hwPreference.size());
-    for (std::size_t i = 0; i < hwPreference.size(); ++i)
+    if (! known) return static_cast<int> (hwPreference.size());
+    for (std::size_t index = 0; index < hwPreference.size(); ++index)
     {
-        if (hwPreference[i] == *ours) return static_cast<int> (i);
+        if (hwPreference[index] == *known) return static_cast<int> (index);
     }
 
     return static_cast<int> (hwPreference.size());
@@ -136,12 +140,12 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
 [[nodiscard]] inline std::vector<HwCandidate> hwCandidates (const AVCodec* codec, const Options& opt,
                                                             std::string& reason)
 {
-    std::vector<HwCandidate> out;
+    std::vector<HwCandidate> candidates;
 
     if (opt.hardware.policy == HardwarePolicy::softwareOnly)
     {
         reason = "softwareOnly policy";
-        return out;
+        return candidates;
     }
 
     AVHWDeviceType wanted = AV_HWDEVICE_TYPE_NONE;
@@ -154,24 +158,24 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
         {
             reason = std::string{ "this FFmpeg build has no hardware device type '" }
                      + std::string{ toString (*opt.hardware.deviceType) } + "'";
-            return out;
+            return candidates;
         }
     }
 
-    for (int i = 0;; ++i)
+    for (int index = 0;; ++index)
     {
-        const AVCodecHWConfig* cfg = avcodec_get_hw_config (codec, i);
+        const AVCodecHWConfig* config = avcodec_get_hw_config (codec, index);
 
-        if (cfg == nullptr) break;
-        if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) == 0) continue;
-        if (wanted != AV_HWDEVICE_TYPE_NONE && cfg->device_type != wanted) continue;
-        const bool dup =
-            std::any_of (out.begin(), out.end(), [&] (const HwCandidate& c) { return c.type == cfg->device_type; });
+        if (config == nullptr) break;
+        if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) == 0) continue;
+        if (wanted != AV_HWDEVICE_TYPE_NONE && config->device_type != wanted) continue;
+        const bool alreadyListed = std::any_of (candidates.begin(), candidates.end(),
+                                                [&] (const HwCandidate& c) { return c.type == config->device_type; });
 
-        if (! dup) out.push_back ({ cfg->device_type, cfg->pix_fmt });
+        if (! alreadyListed) candidates.push_back ({ config->device_type, config->pix_fmt });
     }
 
-    if (out.empty())
+    if (candidates.empty())
     {
         reason = std::string{ "decoder '" } + codec->name;
 
@@ -179,33 +183,33 @@ inline constexpr std::array<HardwareDeviceType, 11> hwPreference{
             reason += std::string{ "' does not support device type '" } + av_hwdevice_get_type_name (wanted) + "'";
         else
             reason += "' has no hardware device configurations";
-        return out;
+        return candidates;
     }
 
-    std::stable_sort (out.begin(), out.end(),
+    std::stable_sort (candidates.begin(), candidates.end(),
                       [] (const HwCandidate& a, const HwCandidate& b) { return hwRank (a.type) < hwRank (b.type); });
-    return out;
+    return candidates;
 }
 
 // Device types that can actually be created on this machine (default device string).
 [[nodiscard]] inline std::vector<HardwareDeviceType> probeAvailableHwTypes()
 {
-    std::vector<HardwareDeviceType> out;
+    std::vector<HardwareDeviceType> candidates;
 
-    for (AVHWDeviceType t = av_hwdevice_iterate_types (AV_HWDEVICE_TYPE_NONE); t != AV_HWDEVICE_TYPE_NONE;
-         t = av_hwdevice_iterate_types (t))
+    for (AVHWDeviceType type = av_hwdevice_iterate_types (AV_HWDEVICE_TYPE_NONE); type != AV_HWDEVICE_TYPE_NONE;
+         type = av_hwdevice_iterate_types (type))
     {
-        AVBufferRef* ref = nullptr;
+        AVBufferRef* reference = nullptr;
 
-        if (av_hwdevice_ctx_create (&ref, t, nullptr, nullptr, 0) == 0)
+        if (av_hwdevice_ctx_create (&reference, type, nullptr, nullptr, 0) == 0)
         {
-            BufferRefPtr owned{ ref };
+            BufferRefPtr ownedReference{ reference };
 
-            if (auto h = fromAv (t)) out.push_back (*h);
+            if (auto known = fromAv (type)) candidates.push_back (*known);
         }
     }
 
-    return out;
+    return candidates;
 }
 
 } // namespace stills::detail

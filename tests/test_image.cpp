@@ -1,11 +1,14 @@
-#include <format>
 #include <functional>
 #include <optional>
 #include <stills/stills_Interop.h>
 #include <type_traits>
 #include <vector>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
+
+#if STILLS_HAS_FORMAT
+#include <format>
+#endif
 
 using namespace testsupport;
 using stills::Image;
@@ -162,6 +165,7 @@ TEST_CASE ("image: getAdjustment() distinguishes the reasons wasClamped() is tru
     }
 }
 
+#if STILLS_HAS_FORMAT
 // Every enum the library hands back formats and prints, so a log line does not depend on which
 // ones happened to have a formatter.
 TEST_CASE ("image: every public enum formats and prints", "[image][api]")
@@ -182,3 +186,4 @@ TEST_CASE ("image: every public enum formats and prints", "[image][api]")
     CHECK (stills::Size{ 64, 48 } < stills::Size{ 64, 49 });
     CHECK (std::hash<stills::Size>{}(stills::Size{ 64, 48 }) == std::hash<stills::Size>{}(stills::Size{ 64, 48 }));
 }
+#endif

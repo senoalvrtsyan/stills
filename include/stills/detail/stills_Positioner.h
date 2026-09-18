@@ -5,20 +5,10 @@
 // `Positioner` decides whether a request can be answered by decoding on, and when it cannot, where
 // to aim the seek and where to aim the next one after that landing proved wrong.
 //
-// Positioner does not seek, and holds no reference to anything. It is the same answer
-// PacketReader::readLanding() reached, for the same reason: the scan chooses a keyframe and
-// returns "go back to this one" as data, because going back is a seek and seeks are not the
-// reader's. Here the reason is larger. A seek is not a call, it is the invalidation of every other
-// type's state — FramePipeline::afterSeek() flushes the decoder, empties three frame slots,
-// resets the frontier, resets the reader's position and the index's contiguity, and only then
-// records where it aimed. A type that performed seeks would have to reach into five other objects,
-// which is the orchestrator's job by definition. So the decisions live here and the acting lives
-// with the owner, and the dependency runs one way: FramePipeline -> Positioner.
-//
-// What a decision needs to read comes in as a `PositioningView`, built at the call and never
-// stored. Same reasoning as KeyframeIndex's ContainerIndex: a re-open replaces the AVStream and
-// rewrites the stream facts, so nothing here may outlive the call it was handed. No decision in
-// this file re-opens anything, so the references in a view cannot go stale inside one.
+// Positioner does not seek and holds no reference to anything: a seek invalidates every other
+// type's state, so acting on a decision is the owner's job, and every decision here comes back as
+// data (an Aim). What a decision needs to read comes in as a `PositioningView`, built at the call
+// and never stored, because a re-open replaces the AVStream and rewrites the stream facts.
 //
 // Timestamps are in the stream's own time base throughout, as everywhere else in the pipeline.
 //
@@ -113,7 +103,7 @@ private:
 struct PositioningView
 {
     const StreamInfo& stream;
-    const KeyframeIndex& keys;
+    const KeyframeIndex& keyframes;
     const DecodeFrontier& frontier;
     const SeekCostModel& costs;
     const Position& position;
@@ -125,14 +115,14 @@ class Positioner
 public:
     // One second, and n frames, in stream ticks. n frames is zero on a stream with no nominal frame
     // duration, which every caller reads as "no margin can be computed".
-    [[nodiscard]] static std::int64_t oneSecond (const StreamInfo& s) noexcept
+    [[nodiscard]] static std::int64_t getOneSecondTicks (const StreamInfo& stream) noexcept
     {
-        return av_rescale_q (1, AVRational{ 1, 1 }, s.timeBase);
+        return av_rescale_q (1, AVRational{ 1, 1 }, stream.timeBase);
     }
 
-    [[nodiscard]] static std::int64_t framesTicks (const StreamInfo& s, int n) noexcept
+    [[nodiscard]] static std::int64_t getFrameTicks (const StreamInfo& stream, int count) noexcept
     {
-        return s.frameDurationHint > 0 ? n * s.frameDurationHint : 0;
+        return stream.frameDurationHint > 0 ? count * stream.frameDurationHint : 0;
     }
 
     // Starts a fresh back-off ladder: a new request, or a promotion that proved the pipeline is
@@ -149,97 +139,98 @@ public:
     // is sound only while every frame between the decoder's frontier and `target` will actually
     // come out. A gap there — a non-reference frame skipped for a request that was abandoned before
     // it got there — would be the frame on screen, and nothing may be concluded across one.
-    [[nodiscard]] static bool canDecodeForwardTo (std::int64_t target, const PositioningView& v) noexcept
+    [[nodiscard]] static bool canDecodeForwardTo (std::int64_t target, const PositioningView& view) noexcept
     {
-        return v.position.isPositioned() && ! v.frontier.drained && ! v.frontier.eof
-               && v.frontier.lastReceivedTs != k::noPts && target >= v.frontier.lastReceivedTs
-               && ! v.frontier.skipped.containsIn (v.frontier.lastReceivedTs, target);
+        return view.position.isPositioned() && ! view.frontier.drained && ! view.frontier.eof
+               && view.frontier.lastReceivedTs != libav::noPts && target >= view.frontier.lastReceivedTs
+               && ! view.frontier.skipped.containsIn (view.frontier.lastReceivedTs, target);
     }
 
     // A landing nothing has been decoded from yet, on a source that cannot seek: it is at the start
     // of the stream, which is the only place a request that cannot seek may begin.
-    [[nodiscard]] static bool isUndecodedStartLanding (const PositioningView& v) noexcept
+    [[nodiscard]] static bool isUndecodedStartLanding (const PositioningView& view) noexcept
     {
-        return hasDecodedNothingSinceLanding (v) && v.position.isLandedAtStart();
+        return hasDecodedNothingSinceLanding (view) && view.position.isLandedAtStart();
     }
 
     // A landing nothing has been decoded from yet, aimed at or just before `target`: close enough
     // that seeking again would land in the same place. select() verifies it against the first frame.
-    [[nodiscard]] bool isUndecodedLandingBefore (std::int64_t target, const PositioningView& v) const noexcept
+    [[nodiscard]] bool isUndecodedLandingBefore (std::int64_t target, const PositioningView& view) const noexcept
     {
-        return hasDecodedNothingSinceLanding (v) && v.position.getSeekTarget() <= target
-               && target - v.position.getSeekTarget() <= getForwardScanLimit (v);
+        return hasDecodedNothingSinceLanding (view) && view.position.getSeekTarget() <= target
+               && target - view.position.getSeekTarget() <= getForwardScanLimit (view);
     }
 
     // Without a trusted index, decode forward when the target is within one GOP (at least 3 s):
     // a seek would land in the same or the next GOP and decode about as many frames anyway.
-    [[nodiscard]] std::int64_t getForwardScanLimit (const PositioningView& v) const noexcept
+    [[nodiscard]] std::int64_t getForwardScanLimit (const PositioningView& view) const noexcept
     {
-        const std::int64_t threeSeconds = av_rescale_q (3, AVRational{ 1, 1 }, v.stream.timeBase);
-        return std::max (threeSeconds, v.keys.getGopHint());
+        const std::int64_t threeSeconds = av_rescale_q (3, AVRational{ 1, 1 }, view.stream.timeBase);
+        return std::max (threeSeconds, view.keyframes.getGopHint());
     }
 
     // True when decoding forward to `target` is cheaper than seeking: the keyframe at or before the
     // target has already been fed to the decoder (both sides in the container's own timestamp
     // domain), or the distance is short. Cost-aware for slow seeks (hardware): frames between the
     // current position and that keyframe are decoded forward while they cost less than a seek.
-    [[nodiscard]] bool isForwardCheaperThanSeek (std::int64_t target, const PositioningView& v) const noexcept
+    [[nodiscard]] bool isForwardCheaperThanSeek (std::int64_t target, const PositioningView& view) const noexcept
     {
-        std::int64_t keyTs = k::noPts; // the covering keyframe, in the same domain as fedTs
-        std::int64_t fedTs = k::noPts;
+        std::int64_t keyTs = libav::noPts; // the covering keyframe, in the same domain as fedTs
+        std::int64_t fedTs = libav::noPts;
         bool covered = false;
 
-        if (v.stream.indexTrusted)
+        if (view.stream.indexTrusted)
         {
-            if (const AVIndexEntry* kf = v.keys.getIndexKeyBefore (target, v.container); kf != nullptr)
+            if (const AVIndexEntry* keyframe = view.keyframes.getIndexKeyBefore (target, view.container);
+                keyframe != nullptr)
             {
-                keyTs = kf->timestamp;
-                fedTs = v.keys.pickIndexTs (v.frontier.lastFedDts, v.frontier.lastFedPts);
+                keyTs = keyframe->timestamp;
+                fedTs = view.keyframes.pickIndexTs (view.frontier.lastFedDts, view.frontier.lastFedPts);
                 covered = true;
             }
         }
-        else if (const KeyEntry* e = v.keys.findCoveringKey (target); e != nullptr)
+        else if (const KeyEntry* entry = view.keyframes.findCoveringKey (target); entry != nullptr)
         {
-            keyTs = e->dts != k::noPts ? e->dts : e->pts;
-            fedTs = e->dts != k::noPts ? v.frontier.lastFedDts : v.frontier.lastFedPts;
+            keyTs = entry->dts != libav::noPts ? entry->dts : entry->pts;
+            fedTs = entry->dts != libav::noPts ? view.frontier.lastFedDts : view.frontier.lastFedPts;
             covered = true;
         }
 
-        if (covered && keyTs != k::noPts && fedTs != k::noPts)
+        if (covered && keyTs != libav::noPts && fedTs != libav::noPts)
         {
             // The covering keyframe has been fed: the target is downstream of the decoder's state.
-            if (keyTs <= fedTs + std::max<std::int64_t> (v.stream.frameDurationHint, 0)) return true;
+            if (keyTs <= fedTs + std::max<std::int64_t> (view.stream.frameDurationHint, 0)) return true;
             // A keyframe lies ahead: forward wins while the frames up to it cost less than a seek (a
             // real trade on hardware decoders and tiny frames).
-            if (v.costs.getFrameCostMs() > 0 && v.stream.frameDurationHint > 0)
+            if (view.costs.getFrameCostMs() > 0 && view.stream.frameDurationHint > 0)
             {
                 const double framesToKey =
-                    static_cast<double> (keyTs - fedTs) / static_cast<double> (v.stream.frameDurationHint);
-                return framesToKey * v.costs.getFrameCostMs() < v.costs.getSeekCostMs();
+                    static_cast<double> (keyTs - fedTs) / static_cast<double> (view.stream.frameDurationHint);
+                return framesToKey * view.costs.getFrameCostMs() < view.costs.getSeekCostMs();
             }
 
             return false;
         }
 
-        if (v.stream.indexTrusted)
-            return target - v.frontier.lastReceivedTs
-                   <= framesTicks (v.stream,
-                                   4); // the index does not cover P (unread fragment): seeks are exact there
-        return target - v.frontier.lastReceivedTs <= getForwardScanLimit (v);
+        if (view.stream.indexTrusted)
+            return target - view.frontier.lastReceivedTs
+                   <= getFrameTicks (view.stream,
+                                     4); // the index does not cover target (unread fragment): seeks are exact there
+        return target - view.frontier.lastReceivedTs <= getForwardScanLimit (view);
     }
 
     // Where to aim a seek on a container with a trusted index. Fragmented MP4 is learned: its
     // demuxer applies no reorder shift, so later seek targets carry it and land right the first
     // time (`seekBias`, learned in retryAfterOvershoot()).
-    [[nodiscard]] std::int64_t getIndexedAim (std::int64_t P) const noexcept { return P - seekBias; }
+    [[nodiscard]] std::int64_t getIndexedAim (std::int64_t target) const noexcept { return target - seekBias; }
 
     // Where to aim on a container without a trusted index: one GOP early, plus room for the
-    // reorder delay, so the scan starts before the keyframe covering P rather than after it.
-    [[nodiscard]] static std::int64_t getScanAim (std::int64_t P, const PositioningView& v) noexcept
+    // reorder delay, so the scan starts before the keyframe covering target rather than after it.
+    [[nodiscard]] static std::int64_t getScanAim (std::int64_t target, const PositioningView& view) noexcept
     {
-        const std::int64_t margin = framesTicks (v.stream, 2) + v.keys.getReorderTicks();
-        const std::int64_t gopHint = v.keys.getGopHint();
-        return P - margin - (gopHint > 0 ? gopHint : 0);
+        const std::int64_t margin = getFrameTicks (view.stream, 2) + view.keyframes.getReorderTicks();
+        const std::int64_t gopHint = view.keyframes.getGopHint();
+        return target - margin - (gopHint > 0 ? gopHint : 0);
     }
 
     // Where to aim next, and whether to give up and go to the start instead. Advances the ladder,
@@ -250,60 +241,65 @@ public:
         bool toStart{ false }; // the ladder is spent, or the target is at or before the stream's start
     };
 
-    // The landing on a trusted index overshot: the first keyframe packet after it is past `P`.
+    // The landing on a trusted index overshot: the first keyframe packet after it is past `target`.
     // Aims at the keyframe strictly before it, retreating by a whole GOP more on each further round.
     //
     // `keyPts`/`keyDts` are that keyframe packet's. The reorder delay is read from the packet when
     // it carries both (mov), and from the index otherwise (Matroska keyframes carry no dts).
-    [[nodiscard]] Aim retryAfterOvershoot (std::int64_t P, std::int64_t keyPts, std::int64_t keyDts, int round,
-                                           const PositioningView& v) noexcept
+    [[nodiscard]] Aim retryAfterOvershoot (std::int64_t target, std::int64_t keyPts, std::int64_t keyDts, int round,
+                                           const PositioningView& view) noexcept
     {
         // Read after the landing, not before it: the packets it just read may have lowered the delay.
-        const std::int64_t reorderTicks = v.keys.getReorderTicks();
-        const std::int64_t delay = (keyDts != k::noPts && keyPts > keyDts) ? keyPts - keyDts : reorderTicks;
+        const std::int64_t reorderTicks = view.keyframes.getReorderTicks();
+        const std::int64_t reorderDelay = (keyDts != libav::noPts && keyPts > keyDts) ? keyPts - keyDts : reorderTicks;
 
-        if (keyDts != k::noPts && reorderTicks > 0 && keyDts > P - reorderTicks && seekBias == 0)
-        {
-            // The demuxer searched its DTS index with our PTS unshifted (fragmented MP4): remember the
-            // reorder delay so the next seek aims right. Open-GOP overshoots (the CRA's DTS is already
-            // below P - delay) must not set it, or every seek would land a GOP early.
-            seekBias = reorderTicks;
-        }
+        // The demuxer searched its DTS index with our PTS unshifted (fragmented MP4): remember the
+        // reorder delay so the next seek aims right. Open-GOP overshoots (the CRA's DTS is already
+        // below target - delay) must not set it, or every seek would land a GOP early.
+        const bool searchedUnshifted =
+            keyDts != libav::noPts && reorderTicks > 0 && keyDts > target - reorderTicks && seekBias == 0;
+
+        if (searchedUnshifted) seekBias = reorderTicks;
 
         if (round >= 3 || backoffs >= maxBackoffs) return Aim{ 0, true };
-        const std::int64_t target =
-            keyPts - 1 - delay
-            - (round > 0 ? std::max ({ oneSecond (v.stream), v.keys.getGopHint(), std::int64_t{ 1 } }) * round : 0);
+        const std::int64_t aimTarget =
+            keyPts - 1 - reorderDelay
+            - (round > 0
+                   ? std::max ({ getOneSecondTicks (view.stream), view.keyframes.getGopHint(), std::int64_t{ 1 } })
+                         * round
+                   : 0);
         ++backoffs;
-        return Aim{ target, false };
+        return Aim{ aimTarget, false };
     }
 
-    // Where to retreat to after a landing proved to be past `P`. The new target is the observed
+    // Where to retreat to after a landing proved to be past `target`. The new target is the observed
     // keyframe (or the last target) minus a doubling step (starting at the GOP length, at least one
     // second) and a reorder margin: the generic seek lands on the last packet with DTS <= target,
     // and a keyframe's DTS precedes its PTS, so aiming exactly at a keyframe lands just after it.
-    [[nodiscard]] Aim nextBackoff (std::int64_t P, std::int64_t observedKey /* or k::noPts */,
-                                   const PositioningView& v) noexcept
+    [[nodiscard]] Aim nextBackoff (std::int64_t target, std::int64_t observedKey /* or libav::noPts */,
+                                   const PositioningView& view) noexcept
     {
-        if (backoffStep <= 0) backoffStep = std::max ({ oneSecond (v.stream), v.keys.getGopHint(), std::int64_t{ 1 } });
-        const std::int64_t margin = framesTicks (v.stream, 2) + v.keys.getReorderTicks();
-        const std::int64_t lastTarget = v.position.getSeekTarget();
-        const std::int64_t anchor = std::min (P, observedKey != k::noPts ? observedKey : lastTarget);
+        if (backoffStep <= 0)
+            backoffStep =
+                std::max ({ getOneSecondTicks (view.stream), view.keyframes.getGopHint(), std::int64_t{ 1 } });
+        const std::int64_t margin = getFrameTicks (view.stream, 2) + view.keyframes.getReorderTicks();
+        const std::int64_t previousTarget = view.position.getSeekTarget();
+        const std::int64_t anchor = std::min (target, observedKey != libav::noPts ? observedKey : previousTarget);
         std::int64_t earlier = anchor - backoffStep - margin;
 
-        if (earlier >= lastTarget) earlier = lastTarget - backoffStep; // always strictly earlier than last time
+        if (earlier >= previousTarget) earlier = previousTarget - backoffStep; // always strictly earlier than last time
         if (backoffStep < std::numeric_limits<std::int64_t>::max() / 2) backoffStep *= 2;
-        if (++backoffs >= maxBackoffs || earlier <= v.stream.startPts) return Aim{ 0, true };
+        if (++backoffs >= maxBackoffs || earlier <= view.stream.startPts) return Aim{ 0, true };
         return Aim{ earlier, false };
     }
 
 private:
     // Positioned, with no frame out of the decoder since: the landing itself is all there is to go
     // on. `drained`/`eof` exclude a decoder that has nothing left to give without a flush.
-    [[nodiscard]] static bool hasDecodedNothingSinceLanding (const PositioningView& v) noexcept
+    [[nodiscard]] static bool hasDecodedNothingSinceLanding (const PositioningView& view) noexcept
     {
-        return v.position.isPositioned() && ! v.frontier.drained && ! v.frontier.eof
-               && v.frontier.lastReceivedTs == k::noPts;
+        return view.position.isPositioned() && ! view.frontier.drained && ! view.frontier.eof
+               && view.frontier.lastReceivedTs == libav::noPts;
     }
 
     // Hard cap on landing back-offs per request; the doubling step reaches the start long before.

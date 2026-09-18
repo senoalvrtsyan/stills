@@ -4,10 +4,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <stills/stills_Stills.h>
 
-#include "support/collector.hpp"
-#include "support/expect.hpp"
-#include "support/fixtures.hpp"
-#include "support/frame_index.hpp"
+#include "support/stills_TestCollector.h"
+#include "support/stills_TestExpect.h"
+#include "support/stills_TestFixtures.h"
+#include "support/stills_TestFrameIndex.h"
 
 namespace testsupport
 {

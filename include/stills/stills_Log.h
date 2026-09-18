@@ -24,53 +24,53 @@ enum class LogLevel : std::int8_t
 
 inline void setLogLevel (LogLevel level) noexcept
 {
-    int av = AV_LOG_INFO;
+    int avLevel = AV_LOG_INFO;
     switch (level)
     {
     case LogLevel::quiet:
-        av = AV_LOG_QUIET;
+        avLevel = AV_LOG_QUIET;
         break;
     case LogLevel::panic:
-        av = AV_LOG_PANIC;
+        avLevel = AV_LOG_PANIC;
         break;
     case LogLevel::fatal:
-        av = AV_LOG_FATAL;
+        avLevel = AV_LOG_FATAL;
         break;
     case LogLevel::error:
-        av = AV_LOG_ERROR;
+        avLevel = AV_LOG_ERROR;
         break;
     case LogLevel::warning:
-        av = AV_LOG_WARNING;
+        avLevel = AV_LOG_WARNING;
         break;
     case LogLevel::info:
-        av = AV_LOG_INFO;
+        avLevel = AV_LOG_INFO;
         break;
     case LogLevel::verbose:
-        av = AV_LOG_VERBOSE;
+        avLevel = AV_LOG_VERBOSE;
         break;
     case LogLevel::debug:
-        av = AV_LOG_DEBUG;
+        avLevel = AV_LOG_DEBUG;
         break;
     case LogLevel::trace:
-        av = AV_LOG_TRACE;
+        avLevel = AV_LOG_TRACE;
         break;
     }
 
-    av_log_set_level (av);
+    av_log_set_level (avLevel);
 }
 
 [[nodiscard]] inline LogLevel getLogLevel() noexcept
 {
-    const int av = av_log_get_level();
+    const int avLevel = av_log_get_level();
 
-    if (av <= AV_LOG_QUIET) return LogLevel::quiet;
-    if (av <= AV_LOG_PANIC) return LogLevel::panic;
-    if (av <= AV_LOG_FATAL) return LogLevel::fatal;
-    if (av <= AV_LOG_ERROR) return LogLevel::error;
-    if (av <= AV_LOG_WARNING) return LogLevel::warning;
-    if (av <= AV_LOG_INFO) return LogLevel::info;
-    if (av <= AV_LOG_VERBOSE) return LogLevel::verbose;
-    if (av <= AV_LOG_DEBUG) return LogLevel::debug;
+    if (avLevel <= AV_LOG_QUIET) return LogLevel::quiet;
+    if (avLevel <= AV_LOG_PANIC) return LogLevel::panic;
+    if (avLevel <= AV_LOG_FATAL) return LogLevel::fatal;
+    if (avLevel <= AV_LOG_ERROR) return LogLevel::error;
+    if (avLevel <= AV_LOG_WARNING) return LogLevel::warning;
+    if (avLevel <= AV_LOG_INFO) return LogLevel::info;
+    if (avLevel <= AV_LOG_VERBOSE) return LogLevel::verbose;
+    if (avLevel <= AV_LOG_DEBUG) return LogLevel::debug;
     return LogLevel::trace;
 }
 

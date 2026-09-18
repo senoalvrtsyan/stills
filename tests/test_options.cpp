@@ -8,7 +8,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace testsupport;
 using stills::AssetImageGenerator;
@@ -142,7 +142,7 @@ TEST_CASE ("time: conveniences", "[time]")
     CHECK (set.size() == 2); // 1/2 == 2/4 == 3/6; 0 == 0/30
     CHECK (std::hash<Time>{}(Time{ 1, 2 }) == std::hash<Time>{}(Time{ 2, 4 }));
     CHECK (std::hash<Time>{}(Time::positiveInfinity()) != std::hash<Time>{}(Time::negativeInfinity()));
-#if defined(__cpp_lib_format)
+#if STILLS_HAS_FORMAT
     CHECK (std::format ("{}", Time{ 1, 2 }) == "0.500000s (1/2)");
     CHECK (std::format ("{}", stills::Rational{ 30, 1 }) == "30/1");
     CHECK (std::format ("{}", stills::Size{ 64, 48 }) == "64x48");

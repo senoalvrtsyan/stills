@@ -36,13 +36,12 @@ class UniqueFunction<R (Args...)>
 
 public:
     UniqueFunction() noexcept = default;
-    UniqueFunction (std::nullptr_t) noexcept {} // NOLINT(google-explicit-constructor)
+    UniqueFunction (std::nullptr_t) noexcept {}
 
     template <class F>
         requires (! std::same_as<std::decay_t<F>, UniqueFunction>
                   && std::is_invocable_r_v<R, std::decay_t<F>&, Args...>)
-    UniqueFunction (F&& f) // NOLINT(google-explicit-constructor)
-      : impl (std::make_unique<Model<std::decay_t<F>>> (std::forward<F> (f)))
+    UniqueFunction (F&& f) : impl (std::make_unique<Model<std::decay_t<F>>> (std::forward<F> (f)))
     {
     }
 

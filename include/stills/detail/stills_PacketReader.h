@@ -43,24 +43,20 @@ class PacketReader
 {
 public:
     // Allocates the live packet and the parking slot. Runs after every MediaSource open and
-    // re-open, because both belong to the run over one container.
-    //
-    // It does *not* clear the replay buffer. What makes a buffer surviving a re-open harmless is
-    // that every path that re-opens reaches readLanding() next, whose first act is clearGopBuffer(),
-    // so nothing ever replays packets read from the container that was closed. Clearing it here
-    // would be tighter but would change behaviour on a path nothing currently reaches; it is left
-    // as is on purpose, and this comment is the record of that.
+    // re-open. The replay buffer is left alone: every path that re-opens reaches readLanding()
+    // next, whose first act is clearGopBuffer(), so nothing replays packets read from the container
+    // that was closed.
     [[nodiscard]] std::expected<void, Error> attach()
     {
-        auto p = makePacket();
+        auto copy = makePacket();
 
-        if (! p) return std::unexpected (p.error());
-        pkt = std::move (*p);
-        pktPending = false;
-        auto lp = makePacket();
+        if (! copy) return std::unexpected (copy.error());
+        packet = std::move (*copy);
+        packetPending = false;
+        auto parkedAllocation = makePacket();
 
-        if (! lp) return std::unexpected (lp.error());
-        landPkt = std::move (*lp);
+        if (! parkedAllocation) return std::unexpected (parkedAllocation.error());
+        parkedPacket = std::move (*parkedAllocation);
         return {};
     }
 
@@ -73,32 +69,32 @@ public:
         clearGopBuffer();
         demuxErrors = 0;
 
-        if (pktPending && pkt) av_packet_unref (pkt.get());
-        pktPending = false;
+        if (packetPending && packet) av_packet_unref (packet.get());
+        packetPending = false;
 
-        if (landPkt) av_packet_unref (landPkt.get());
+        if (parkedPacket) av_packet_unref (parkedPacket.get());
     }
 
     // A re-opened (or grown) source may reach further than the old one did, so what was read from
     // the old one proves nothing about the new one.
-    void resetVerifiedTo() noexcept { verifiedTo = k::noPts; }
+    void resetVerifiedTo() noexcept { verifiedTo = libav::noPts; }
 
     // The live packet. Valid from attach() onwards; the pipeline has none before it opens.
-    [[nodiscard]] AVPacket& getPacket() noexcept { return *pkt; }
-    [[nodiscard]] const AVPacket& getPacket() const noexcept { return *pkt; }
+    [[nodiscard]] AVPacket& getPacket() noexcept { return *packet; }
+    [[nodiscard]] const AVPacket& getPacket() const noexcept { return *packet; }
 
     // True when the live packet is being held for a retry: it has not been consumed and must be
     // sent again unchanged.
-    [[nodiscard]] bool isPacketPending() const noexcept { return pktPending; }
+    [[nodiscard]] bool isPacketPending() const noexcept { return packetPending; }
 
     // The decoder refused the packet (EAGAIN): keep it, unchanged, for the next send.
-    void holdPacketForRetry() noexcept { pktPending = true; }
+    void holdPacketForRetry() noexcept { packetPending = true; }
 
     // The packet has been consumed, or the retry is being abandoned: unref it and stop holding it.
     void releasePacket() noexcept
     {
-        av_packet_unref (pkt.get());
-        pktPending = false;
+        av_packet_unref (packet.get());
+        packetPending = false;
     }
 
     // Drops the live packet's contents and deliberately leaves the pending flag as it was: the
@@ -106,40 +102,40 @@ public:
     // packet is a separate question it has no business answering.
     //
     // The distinction from releasePacket() is not cosmetic. At the keyframe-tail check
-    // (FramePipeline::verifyKeyframeTail) the flag can still be set from a send that returned
+    // (FrameSelector::verifyKeyframeTail) the flag can still be set from a send that returned
     // EAGAIN, over a packet this very loop has already overwritten. Clearing it there would be a
     // behaviour change, not a tidy-up: what makes that state safe is that the loop ends with
     // `position.markInvalid()`, so the next request repositions and resetPosition() clears the
     // flag before anything could send the packet. Do not collapse the two without moving that
     // guarantee.
-    void unrefPacket() noexcept { av_packet_unref (pkt.get()); }
+    void unrefPacket() noexcept { av_packet_unref (packet.get()); }
 
     // Whether the demuxer flags keyframe packets at all. Learned from the very first packet of the
     // stream: a demuxer that never sets the flag must not make the pipeline skip.
     [[nodiscard]] bool areKeyFlagsReliable() const noexcept { return keyFlagsReliable; }
 
-    // The largest packet presentation time actually read from the source, k::noPts if none. This
+    // The largest packet presentation time actually read from the source, libav::noPts if none. This
     // is evidence that the stream reaches that far, which a decoded frame alone is not.
     [[nodiscard]] std::int64_t getVerifiedTo() const noexcept { return verifiedTo; }
 
     // Reads the next packet of our stream into the live packet (other streams are dropped), and
-    // tells the keyframe index about it. Returns 0, k::eof (after a live-source growth check),
-    // k::exitRequested or a demux error (transient ones are skipped up to a limit).
+    // tells the keyframe index about it. Returns 0, libav::eof (after a live-source growth check),
+    // libav::exitRequested or a demux error (transient ones are skipped up to a limit).
     //
     // `tainted` is set — never cleared — when a demux error forced packets to be skipped: there is
     // a hole in what the decoder will be fed, and the caller owns the state that records it.
     //
     // Not noexcept: the keyframe index this records into allocates. A std::bad_alloc here would be
     // std::terminate rather than the ErrorCode::outOfMemory the API can report.
-    [[nodiscard]] int readVideoPacket (MediaSource& source, KeyframeIndex& keys, bool& tainted,
+    [[nodiscard]] int readVideoPacket (MediaSource& source, KeyframeIndex& keyframes, bool& tainted,
                                        const CancelToken& token)
     {
         if (isServingReplay())
         {
             // Replayed packets were recorded when they were first read; recording one twice would drag
             // the index's contiguity cursor backwards.
-            av_packet_unref (pkt.get());
-            av_packet_move_ref (pkt.get(), gopBuffer[replayPos].get());
+            av_packet_unref (packet.get());
+            av_packet_move_ref (packet.get(), gopBuffer[replayPos].get());
 
             if (++replayPos == gopBuffer.size()) clearGopBuffer();
             return 0;
@@ -149,12 +145,12 @@ public:
 
         for (;;)
         {
-            if (token.isRequested()) return k::exitRequested;
-            int r = source.readPacket (*pkt);
+            if (token.isRequested()) return libav::exitRequested;
+            int result = source.readPacket (*packet);
 
-            if (r == k::exitRequested) return r;
-            if (r == k::eof || (r < 0 && ++demuxErrors > maxConsecutiveDemuxErrors)) return k::eof;
-            if (r < 0)
+            if (result == libav::exitRequested) return result;
+            if (result == libav::eof || (result < 0 && ++demuxErrors > maxConsecutiveDemuxErrors)) return libav::eof;
+            if (result < 0)
             {
                 tainted = true;
                 continue; // transient demux error: skip and keep reading
@@ -162,14 +158,14 @@ public:
 
             demuxErrors = 0;
 
-            if (pkt->stream_index == index && pkt->pts != k::noPts)
+            if (packet->stream_index == index && packet->pts != libav::noPts)
             {
-                verifiedTo = verifiedTo == k::noPts ? pkt->pts : std::max (verifiedTo, pkt->pts);
+                verifiedTo = verifiedTo == libav::noPts ? packet->pts : std::max (verifiedTo, packet->pts);
             }
 
-            if (pkt->stream_index != index)
+            if (packet->stream_index != index)
             {
-                av_packet_unref (pkt.get());
+                av_packet_unref (packet.get());
                 continue;
             }
 
@@ -178,10 +174,10 @@ public:
                 // Trust the demuxer's keyframe flags only if it flags the very first packet; a demuxer
                 // that never sets the flag must not make us skip.
                 firstPacketSeen = true;
-                keyFlagsReliable = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
+                keyFlagsReliable = (packet->flags & AV_PKT_FLAG_KEY) != 0;
             }
 
-            keys.notePacket (*pkt, containerIndexOf (source));
+            keyframes.notePacket (*packet, containerIndexOf (source));
             return 0;
         }
     }
@@ -199,16 +195,16 @@ public:
             timestampSeek
         };
 
-        bool found{ false };                  // a keyframe packet at or before P is ready (pending or positioned)
-        std::int64_t firstKeyPts{ k::noPts }; // the first keyframe packet seen (> P when !found)
-        std::int64_t firstKeyDts{ k::noPts };
+        bool found{ false }; // a keyframe packet at or before target is ready (pending or positioned)
+        std::int64_t firstKeyPts{ libav::noPts }; // the first keyframe packet seen (> target when !found)
+        std::int64_t firstKeyDts{ libav::noPts };
         bool eof{ false };
         // The chosen keyframe's GOP is buffered for replay, so the next packet the decoder sees is
         // that keyframe: the caller's positioning state must say a keyframe is still awaited.
         bool awaitKey{ false };
         Rewind rewind{ Rewind::none };
-        KeyEntry rewindEntry{};            // Rewind::byteSeek: the keyframe to seek back to
-        std::int64_t rewindTs{ k::noPts }; // Rewind::timestampSeek: the timestamp to aim at
+        KeyEntry rewindEntry{};                // Rewind::byteSeek: the keyframe to seek back to
+        std::int64_t rewindTs{ libav::noPts }; // Rewind::timestampSeek: the timestamp to aim at
     };
 
     // Establishes where a seek landed from the packets, without decoding.
@@ -221,27 +217,27 @@ public:
     // owes them too.
     //
     // `scan == false` (trusted index): the first keyframe packet is the landing, held for the
-    // decoder when it is at or before P. `scan == true` (no index): keeps reading through the GOPs
-    // up to P, records every keyframe, and settles on the last keyframe at or before P — held for a
+    // decoder when it is at or before target. `scan == true` (no index): keeps reading through the GOPs
+    // up to target, records every keyframe, and settles on the last keyframe at or before target — held for a
     // keyframe-only decode, or reached again with a byte seek for an exact decode.
-    [[nodiscard]] std::expected<Landing, Error> readLanding (MediaSource& source, KeyframeIndex& keys, std::int64_t P,
-                                                             bool scan, bool keyframeMode, bool& tainted,
-                                                             const CancelToken& token)
+    [[nodiscard]] std::expected<Landing, Error> readLanding (MediaSource& source, KeyframeIndex& keyframes,
+                                                             std::int64_t target, bool scan, bool keyframeMode,
+                                                             bool& tainted, const CancelToken& token)
     {
         const ContainerIndex container = containerIndexOf (source);
-        const std::int64_t hint = source.getStreamInfo().frameDurationHint;
-        const std::int64_t oneFrame = hint > 0 ? hint : std::int64_t{ 0 };
-        Landing L;
-        std::int64_t bestPts = k::noPts, bestDts = k::noPts, bestPos = -1;
-        bool bestHeld = false;              // keyframe mode: the best packet is parked in the reader
-        bool buffering = false;             // exact mode: packets after the best keyframe are kept for replay
-        bool scanning = scan;               // becomes true on a trusted-index container whose seek undershot
-        std::int64_t landingPts = k::noPts; // first packet read after the seek
-        // The keyframe-only arming path passes P = INT64_MAX ("the next keyframe, wherever
+        const std::int64_t frameDuration = source.getStreamInfo().frameDurationHint;
+        const std::int64_t oneFrame = frameDuration > 0 ? frameDuration : std::int64_t{ 0 };
+        Landing landing;
+        std::int64_t bestPts = libav::noPts, bestDts = libav::noPts, bestPos = -1;
+        bool isBestParked = false;              // keyframe mode: the best packet is parked in the reader
+        bool buffering = false;                 // exact mode: packets after the best keyframe are kept for replay
+        bool scanning = scan;                   // becomes true on a trusted-index container whose seek undershot
+        std::int64_t landingPts = libav::noPts; // first packet read after the seek
+        // The keyframe-only arming path passes target = INT64_MAX ("the next keyframe, wherever
         // it is"): saturate.
         std::int64_t horizon = 0;
 
-        if (__builtin_add_overflow (P, keys.getReorderTicks() + oneFrame, &horizon))
+        if (__builtin_add_overflow (target, keyframes.getReorderTicks() + oneFrame, &horizon))
         {
             horizon = std::numeric_limits<std::int64_t>::max();
         }
@@ -250,17 +246,17 @@ public:
 
         for (;;)
         {
-            const int r = readVideoPacket (source, keys, tainted, token);
+            const int result = readVideoPacket (source, keyframes, tainted, token);
 
-            if (r == k::exitRequested)
+            if (result == libav::exitRequested)
             {
                 if (token.isRequested()) return fail (ErrorCode::cancelled, "cancelled");
-                return fail (ErrorCode::decodeFailed, r, "av_read_frame: interrupted without a cancellation");
+                return fail (ErrorCode::decodeFailed, result, "av_read_frame: interrupted without a cancellation");
             }
 
-            if (r == k::eof)
+            if (result == libav::eof)
             {
-                L.eof = true;
+                landing.eof = true;
                 break;
             }
 
@@ -269,34 +265,39 @@ public:
                 // Cannot tell keyframes apart at the packet level: feed everything, the decoder sorts it
                 // out.
                 holdPacketForRetry();
-                L.found = true;
-                return L;
+                landing.found = true;
+                return landing;
             }
 
-            const AVPacket& pkt = *this->pkt;
-            const bool key = (pkt.flags & AV_PKT_FLAG_KEY) != 0;
+            const AVPacket& current = *packet;
+            const bool isKey = (current.flags & AV_PKT_FLAG_KEY) != 0;
             const std::int64_t pts =
-                pkt.pts != k::noPts ? pkt.pts
-                                    // Read fresh: notePacket() may have just lowered the delay from this very packet.
-                                    : (pkt.dts != k::noPts ? pkt.dts + keys.getReorderTicks() : k::noPts);
+                current.pts != libav::noPts
+                    ? current.pts
+                    // Read fresh: notePacket() may have just lowered the delay from this very current.
+                    : (current.dts != libav::noPts ? current.dts + keyframes.getReorderTicks() : libav::noPts);
 
-            if (landingPts == k::noPts && pts != k::noPts) landingPts = pts;
-            if (! key)
+            if (landingPts == libav::noPts && pts != libav::noPts) landingPts = pts;
+            if (! isKey)
             {
                 if (buffering)
                 {
                     // Part of the chosen keyframe's GOP: keep it instead of reading it twice.
-                    const bool past = pts != k::noPts && pts > horizon;
+                    const bool isPastHorizon = pts != libav::noPts && pts > horizon;
 
                     if (! bufferPacket()) buffering = false; // over the cap: fall back to a byte seek
-                    if (scanning && bestPts != k::noPts && past)
-                        break; // every later packet is past P in decode order too
+                    if (scanning && bestPts != libav::noPts && isPastHorizon)
+                        break; // every later packet is past target in decode order too
                     continue;
                 }
 
-                // In keyframe mode the scan runs on to the next keyframe so the chosen one's GOP extent is
+                // An exact-mode scan is over once a packet past the horizon follows a chosen keyframe. In
+                // keyframe mode the scan runs on to the next keyframe so the chosen one's GOP extent is
                 // recorded and later requests inside it are answered from the held frame.
-                if (scanning && ! keyframeMode && bestPts != k::noPts && pts != k::noPts && pts > horizon)
+                const bool scanIsComplete =
+                    scanning && ! keyframeMode && bestPts != libav::noPts && pts != libav::noPts && pts > horizon;
+
+                if (scanIsComplete)
                 {
                     unrefPacket();
                     break;
@@ -306,24 +307,24 @@ public:
                 continue;
             }
 
-            if (pts == k::noPts)
+            if (pts == libav::noPts)
             {
                 holdPacketForRetry(); // a keyframe without a timestamp: nothing to verify against
-                L.found = true;
-                return L;
+                landing.found = true;
+                return landing;
             }
 
-            if (L.firstKeyPts == k::noPts)
+            if (landing.firstKeyPts == libav::noPts)
             {
-                L.firstKeyPts = pts;
-                L.firstKeyDts = pkt.dts;
+                landing.firstKeyPts = pts;
+                landing.firstKeyDts = current.dts;
                 // No keyframe between the landing and this one: the GOP is at least that long.
-                keys.noteKeyframeSpan (landingPts, pts);
+                keyframes.noteKeyframeSpan (landingPts, pts);
             }
 
-            if (pts > P)
+            if (pts > target)
             {
-                if (bestPts != k::noPts)
+                if (bestPts != libav::noPts)
                 {
                     // The keyframe before this one is the answer; this packet is the next in decode order.
                     if (buffering && ! bufferPacket())
@@ -334,32 +335,32 @@ public:
                 }
 
                 unrefPacket();
-                return L; // overshoot: nothing at or before P was seen
+                return landing; // overshoot: nothing at or before target was seen
             }
 
             if (! scanning)
             {
-                if (! keys.hasKeyBetween (pts, P, container))
+                if (! keyframes.hasKeyBetween (pts, target, container))
                 {
-                    holdPacketForRetry(); // the landing keyframe covers P
-                    L.found = true;
-                    return L;
+                    holdPacketForRetry(); // the landing keyframe covers target
+                    landing.found = true;
+                    return landing;
                 }
 
-                // The index records a later keyframe at or before P (mov lands a GOP early on edit-list
-                // files). Read on like a scan: a keyframe past P ends it with the last one at or before P,
+                // The index records a later keyframe at or before target (mov lands a GOP early on edit-list
+                // files). Read on like a scan: a keyframe past target ends it with the last one at or before target,
                 // so a wrong index entry cannot make us overshoot.
                 scanning = true;
             }
 
             bestPts = pts;
-            bestDts = pkt.dts;
-            bestPos = pkt.pos;
+            bestDts = current.dts;
+            bestPos = current.pos;
 
             if (keyframeMode)
             {
                 parkPacket();
-                bestHeld = true;
+                isBestParked = true;
             }
             else
             {
@@ -368,32 +369,32 @@ public:
             }
         }
 
-        if (bestPts == k::noPts)
+        if (bestPts == libav::noPts)
         {
             clearGopBuffer();
-            return L; // tail of the stream without a keyframe, or nothing at all
+            return landing; // tail of the stream without a keyframe, or nothing at all
         }
 
-        if (L.eof)
+        if (landing.eof)
         {
             // The stream ended inside this GOP: its extent is known.
-            keys.noteStreamEndedInGop (bestPts);
+            keyframes.noteStreamEndedInGop (bestPts);
         }
 
-        L.found = true;
+        landing.found = true;
 
-        if (keyframeMode && bestHeld)
+        if (keyframeMode && isBestParked)
         {
             takeParkedPacket();
-            return L;
+            return landing;
         }
 
         if (buffering && hasBufferedGop())
         {
             // The chosen keyframe and its GOP are buffered: decoding replays them.
-            L.awaitKey = true;
+            landing.awaitKey = true;
             beginReplay();
-            return L;
+            return landing;
         }
 
         clearGopBuffer();
@@ -402,17 +403,17 @@ public:
         // refuse byte seeks and re-seek by timestamp below).
         if (bestPos >= 0 && ! container.trusted)
         {
-            const KeyEntry* recorded = keys.findEntry (bestPts);
-            L.rewind = Landing::Rewind::byteSeek;
-            L.rewindEntry = recorded != nullptr ? *recorded : KeyEntry{ bestPts, bestDts, bestPos, k::noPts };
-            L.found = true;
-            return L;
+            const KeyEntry* recorded = keyframes.findEntry (bestPts);
+            landing.rewind = Landing::Rewind::byteSeek;
+            landing.rewindEntry = recorded != nullptr ? *recorded : KeyEntry{ bestPts, bestDts, bestPos, libav::noPts };
+            landing.found = true;
+            return landing;
         }
 
         // No byte position (unusual): re-seek by timestamp.
-        L.rewind = Landing::Rewind::timestampSeek;
-        L.rewindTs = bestPts - keys.getReorderTicks();
-        return L;
+        landing.rewind = Landing::Rewind::timestampSeek;
+        landing.rewindTs = bestPts - keyframes.getReorderTicks();
+        return landing;
     }
 
 private:
@@ -424,26 +425,26 @@ private:
     // the decoder frames whose references were never sent.
     [[nodiscard]] bool bufferPacket()
     {
-        const std::size_t bytes = static_cast<std::size_t> (std::max (pkt->size, 0));
+        const std::size_t bytes = static_cast<std::size_t> (std::max (packet->size, 0));
 
         if (gopBufferBytes + bytes > maxGopBufferBytes)
         {
-            av_packet_unref (pkt.get());
+            av_packet_unref (packet.get());
             clearGopBuffer();
             return false;
         }
 
-        PacketPtr p{ av_packet_alloc() };
+        PacketPtr copy{ av_packet_alloc() };
 
-        if (! p)
+        if (! copy)
         {
-            av_packet_unref (pkt.get());
+            av_packet_unref (packet.get());
             clearGopBuffer();
             return false;
         }
 
-        av_packet_move_ref (p.get(), pkt.get());
-        gopBuffer.push_back (std::move (p));
+        av_packet_move_ref (copy.get(), packet.get());
+        gopBuffer.push_back (std::move (copy));
         gopBufferBytes += bytes;
         return true;
     }
@@ -466,36 +467,36 @@ private:
     // Parks the live packet (keyframe mode: the chosen keyframe, while the scan reads on past it).
     void parkPacket() noexcept
     {
-        av_packet_unref (landPkt.get());
-        av_packet_move_ref (landPkt.get(), pkt.get());
+        av_packet_unref (parkedPacket.get());
+        av_packet_move_ref (parkedPacket.get(), packet.get());
     }
 
     // Makes the parked keyframe the live packet again, held for the decoder.
     void takeParkedPacket() noexcept
     {
-        av_packet_unref (pkt.get());
-        av_packet_move_ref (pkt.get(), landPkt.get());
-        pktPending = true;
+        av_packet_unref (packet.get());
+        av_packet_move_ref (packet.get(), parkedPacket.get());
+        packetPending = true;
     }
 
     // Scanned packets of the chosen GOP are kept for replay up to this much; beyond it (4K at high
     // bit rates) the pipeline goes back to the keyframe with a byte seek instead.
     static constexpr std::size_t maxGopBufferBytes = 64u << 20;
-    // Matches the decoder's own limit in stills_FramePipeline.h; the two count unrelated things.
+    // Matches FrameSelector's decoder error limit; the two count unrelated things.
     static constexpr int maxConsecutiveDemuxErrors = 32;
 
-    PacketPtr pkt;
-    bool pktPending{ false };         // pkt holds a packet the decoder refused with EAGAIN
-    PacketPtr landPkt;                // keyframe mode: the chosen keyframe packet while scanning past it
-    std::vector<PacketPtr> gopBuffer; // exact mode: the chosen keyframe's packets scanned past P,
+    PacketPtr packet;
+    bool packetPending{ false };      // pkt holds a packet the decoder refused with EAGAIN
+    PacketPtr parkedPacket;           // keyframe mode: the chosen keyframe packet while scanning past it
+    std::vector<PacketPtr> gopBuffer; // exact mode: the chosen keyframe's packets scanned past target,
                                       // replayed to the decoder
     std::size_t gopBufferBytes{ 0 };
     std::size_t replayPos{ 0 };
     bool replaying{ false }; // the scan is over; readVideoPacket serves gopBuffer first
     int demuxErrors{ 0 };
     bool firstPacketSeen{ false };
-    bool keyFlagsReliable{ false };      // the demuxer flags keyframe packets (first packet was flagged)
-    std::int64_t verifiedTo{ k::noPts }; // largest packet presentation time actually read
+    bool keyFlagsReliable{ false };          // the demuxer flags keyframe packets (first packet was flagged)
+    std::int64_t verifiedTo{ libav::noPts }; // largest packet presentation time actually read
 };
 
 } // namespace stills::detail

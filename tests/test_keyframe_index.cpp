@@ -19,12 +19,12 @@
 #include <limits>
 #include <stills/detail/stills_KeyframeIndex.h>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using stills::detail::ContainerIndex;
 using stills::detail::KeyEntry;
 using stills::detail::KeyframeIndex;
-namespace k = stills::detail::k;
+namespace libav = stills::detail::libav;
 
 namespace
 {
@@ -140,7 +140,7 @@ TEST_CASE ("KeyframeIndex: the GOP estimate is a lower bound that only grows", "
     CHECK (idx.getGopHint() == 5000);
     idx.noteKeyframeSpan (0, 100);
     CHECK (idx.getGopHint() == 5000);
-    idx.noteKeyframeSpan (k::noPts, 99999); // nothing was observed: not a span
+    idx.noteKeyframeSpan (libav::noPts, 99999); // nothing was observed: not a span
     CHECK (idx.getGopHint() == 5000);
     idx.noteKeyframeSpan (9000, 8000); // backwards (a timestamp discontinuity)
     CHECK (idx.getGopHint() == 5000);
@@ -193,9 +193,9 @@ TEST_CASE ("KeyframeIndex: packets that say nothing about keyframes are ignored"
 TEST_CASE ("KeyframeIndex: a keyframe with no timestamp or no byte position is not recorded", "[keyframeIndex]")
 {
     KeyframeIndex idx;
-    idx.recordKey (k::noPts, 0, 100, scanned); // nothing to key it by
-    idx.recordKey (1000, 1000, -1, scanned);   // nothing to seek back to
-    CHECK (idx.findEntry (k::noPts) == nullptr);
+    idx.recordKey (libav::noPts, 0, 100, scanned); // nothing to key it by
+    idx.recordKey (1000, 1000, -1, scanned);       // nothing to seek back to
+    CHECK (idx.findEntry (libav::noPts) == nullptr);
     CHECK (idx.findEntry (1000) == nullptr);
 }
 

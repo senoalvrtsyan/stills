@@ -67,6 +67,7 @@ add_executable(stills_tests
   test_containers.cpp
   test_keyframe.cpp
   test_keyframe_index.cpp
+  test_request_window.cpp
   test_output.cpp
   test_transform.cpp
   test_image.cpp
@@ -150,12 +151,15 @@ stills_apply_warnings(stills_value_headers)
 # so an MSVC branch here could never run.
 if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
   set(STILLS_VALUE_HEADER_DEPS ${CMAKE_CURRENT_BINARY_DIR}/value_headers.deps)
+  # The build's own C++ flags travel with the invocation: a Clang build on Linux reaches <expected>
+  # only through -stdlib=libc++, and without it this check would fail on a tree that compiles.
+  separate_arguments(STILLS_VALUE_HEADER_CXX_FLAGS NATIVE_COMMAND "${CMAKE_CXX_FLAGS}")
   add_custom_command(
     OUTPUT ${STILLS_VALUE_HEADER_DEPS}
     # -M, not -MM: -MM drops headers found in system directories, and libav's prefix is one of those
     # on this machine -- the very case this check exists for. Same -std as the target above, because
     # stills_Error.h and stills_Time.h select their <format> include on the language level.
-    COMMAND ${CMAKE_CXX_COMPILER} -std=c++23 -I${PROJECT_SOURCE_DIR}/include -M
+    COMMAND ${CMAKE_CXX_COMPILER} ${STILLS_VALUE_HEADER_CXX_FLAGS} -std=c++23 -I${PROJECT_SOURCE_DIR}/include -M
             -MF ${STILLS_VALUE_HEADER_DEPS}
             ${CMAKE_CURRENT_SOURCE_DIR}/value_headers/value_headers.cpp
     COMMAND ${CMAKE_COMMAND} -DDEPFILE=${STILLS_VALUE_HEADER_DEPS}
@@ -177,6 +181,20 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$")
     VERBATIM)
   add_custom_target(stills_value_headers_check ALL DEPENDS ${STILLS_VALUE_HEADER_DEPS})
 endif()
+
+# ---- build-time check: the library headers are clean under the strict warning set -------------
+# Every other target sees the headers through -isystem (the INTERFACE target marks them SYSTEM so a
+# consumer's warnings never fire inside them), which also means the warning set never runs over the
+# library itself. This TU includes every public header with a plain -I, so a warning in our own code
+# (a constructor parameter shadowing a member, a useless cast) fails the build here instead of on a
+# consumer's machine. libav's headers stay SYSTEM through the imported target, as they do for a
+# consumer using pkg-config.
+add_library(stills_header_warnings OBJECT header_warnings/header_warnings.cpp)
+target_include_directories(stills_header_warnings PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(stills_header_warnings PRIVATE PkgConfig::FFMPEG Threads::Threads)
+target_compile_features(stills_header_warnings PRIVATE cxx_std_23)
+stills_apply_warnings(stills_header_warnings)
+target_compile_options(stills_header_warnings PRIVATE $<$<CXX_COMPILER_ID:GNU>:-Wuseless-cast>)
 
 # ---- benchmark ---------------------------------------------------------------------------------
 # Before/after numbers for the pipeline restructure: milliseconds per request, and the seek and

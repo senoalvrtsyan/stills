@@ -35,16 +35,10 @@ find_package(PkgConfig REQUIRED)
 # Lower bounds, matching the static_asserts in detail/stills_FFmpeg.h (FFmpeg 6.1). Keep them in step:
 # with only the major versions here, FFmpeg 6.0 configures cleanly and then fails mid-compile on a
 # static_assert, which is a much worse error than one from pkg-config.
-# There is deliberately no upper bound, and the headers no longer impose one either. The
-# headers used to impose one -- an #error on a libavformat major the AVIOContext recovery had not
-# been verified against, on a path only a cancelled request reaches -- which pkg-config could not
-# see, so a newer FFmpeg configured cleanly and then died mid-compile. That guard is now
-# tryResetIoState() in detail/stills_MediaSource.h: above the verified range it returns false and the
-# caller re-opens the source, so a new major builds and costs one re-open per interrupt recovery on
-# a rewindable source. On a pipe there is nothing to re-open and the stuck read still fails -- the
-# same outcome as before, minus the build failure.
-# The verified upper end lives in that one #if and is stated in the README; it is not a build
-# requirement, so it is not enforced here.
+# No upper bound. The one version-specific path (clearing libavio's sticky state after an interrupted
+# read, MediaSource::tryResetIoState) degrades to a re-open on a libavformat major it has not been
+# verified against, so a newer FFmpeg builds and runs. The verified range is stated in the README and
+# is not a build requirement.
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
   libavformat>=60.16
   libavcodec>=60.31

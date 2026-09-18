@@ -10,7 +10,7 @@
 
 #include "stills/detail/stills_Config.h"
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 #include <format>
 #endif
 
@@ -31,14 +31,14 @@ struct Size
     friend constexpr std::strong_ordering operator<=> (const Size&, const Size&) noexcept = default;
 };
 
-[[nodiscard]] inline std::string toString (Size s)
+[[nodiscard]] inline std::string toString (Size size)
 {
-    return std::to_string (s.width) + "x" + std::to_string (s.height);
+    return std::to_string (size.width) + "x" + std::to_string (size.height);
 }
 
-inline std::ostream& operator<< (std::ostream& os, Size s)
+inline std::ostream& operator<< (std::ostream& os, Size size)
 {
-    return os << toString (s);
+    return os << toString (size);
 }
 
 } // namespace stills
@@ -46,21 +46,21 @@ inline std::ostream& operator<< (std::ostream& os, Size s)
 template <>
 struct std::hash<stills::Size>
 {
-    [[nodiscard]] constexpr std::size_t operator() (stills::Size s) const noexcept
+    [[nodiscard]] constexpr std::size_t operator() (stills::Size size) const noexcept
     {
-        return static_cast<std::size_t> (static_cast<unsigned> (s.width)) * 0x9E3779B97F4A7C15ULL
-               + static_cast<std::size_t> (static_cast<unsigned> (s.height));
+        return static_cast<std::size_t> (static_cast<unsigned int> (size.width)) * 0x9E3779B97F4A7C15ULL
+               + static_cast<std::size_t> (static_cast<unsigned int> (size.height));
     }
 };
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 template <>
 struct std::formatter<stills::Size> : std::formatter<std::string>
 {
     template <class Ctx>
-    auto format (stills::Size s, Ctx& ctx) const
+    auto format (stills::Size size, Ctx& ctx) const
     {
-        return std::formatter<std::string>::format (stills::toString (s), ctx);
+        return std::formatter<std::string>::format (stills::toString (size), ctx);
     }
 };
 #endif

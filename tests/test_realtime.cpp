@@ -3,7 +3,7 @@
 // a keyframe, and consecutive pulls across a keyframe boundary. Every case is a sequence of
 // requests on one generator, and the assertion is always the same: each request returns exactly
 // the frame that covers it, reported at exactly its own time.
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace testsupport;
 using stills::AssetImageGenerator;

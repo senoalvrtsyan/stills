@@ -177,7 +177,7 @@ inline std::ostream& operator<< (std::ostream& os, ColorRange r)
 
 } // namespace stills
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 #include <format>
 /// Every enum this library hands back formats, so a consumer's log line does not have to remember
 /// which ones happened to have a formatter and which only an ostream inserter.

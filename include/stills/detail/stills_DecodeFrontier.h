@@ -1,18 +1,14 @@
 #pragma once
 // stills/detail/stills_DecodeFrontier.h — how far the decoder has got, and what it never produced.
 //
-// DecodeFrontier is the state five jobs in the pipeline share: what has been fed to the decoder,
+// DecodeFrontier is the state positioning and selection share: what has been fed to the decoder,
 // what has come back out, whether the stream ended, and which frames were skipped on purpose.
-// Positioning reads it to choose seek-versus-decode-forward, selection writes it, recovery
-// invalidates it. Naming it is what lets those become separate types later without back-pointers:
-// the decode loop owns it and the positioner takes it as a `const&`, so "reads the frontier" and
-// "writes the frontier" are visible in the signatures rather than implied by comments.
+// FrameSelector owns and writes it; Positioner reads it as a `const&`.
 //
 // Everything in it is invalidated together, because a reposition makes all of it describe a place
-// the decoder no longer is. That is what reset() is, and why the fields are one struct rather than
-// twelve FramePipeline members. One caller contradicts that on purpose: recoverAfterInterrupt()
-// carries lastReceivedTs across the reset, because a source that cannot be rewound really is still
-// at or after that frame. It is the only such exception and it says so at the call site.
+// the decoder no longer is. That is what reset() is. One caller carries a single field across the
+// reset on purpose: after an interrupt on a source that cannot be rewound, the demuxer really is
+// still at or after the last frame that came out (FramePipeline::recoverAfterInterrupt).
 //
 // A struct, not a class: centralising invalidation is what this type is for, and no two fields
 // here have to agree with each other. FrameSlot is a class because two of its do.
@@ -39,7 +35,7 @@ namespace stills::detail
 // not the decision to continue forward instead of seeking.
 //
 // Invariant, stated once here rather than at each of the call sites: `holes` is sorted ascending,
-// holds no duplicates, contains no k::noPts, and never grows past maxHoles.
+// holds no duplicates, contains no libav::noPts, and never grows past maxHoles.
 class SkippedFrames
 {
 public:
@@ -47,34 +43,34 @@ public:
     // gap ahead of the decoder's frontier, which is why these outlive the request that caused them.
     void record (std::int64_t pts)
     {
-        if (pts == k::noPts) return;
-        const auto it = std::lower_bound (holes.begin(), holes.end(), pts);
+        if (pts == libav::noPts) return;
+        const auto position = std::lower_bound (holes.begin(), holes.end(), pts);
 
-        if (it != holes.end() && *it == pts) return;
+        if (position != holes.end() && *position == pts) return;
         if (holes.size() >= maxHoles)
         {
             holes.clear(); // pathological: forget everything rather than grow without bound
             return;
         }
 
-        holes.insert (it, pts);
+        holes.insert (position, pts);
     }
 
     // The frame was decoded after all: it is no longer a gap.
     void clearAt (std::int64_t pts) noexcept
     {
-        if (holes.empty() || pts == k::noPts) return;
-        const auto it = std::lower_bound (holes.begin(), holes.end(), pts);
+        if (holes.empty() || pts == libav::noPts) return;
+        const auto position = std::lower_bound (holes.begin(), holes.end(), pts);
 
-        if (it != holes.end() && *it == pts) holes.erase (it);
+        if (position != holes.end() && *position == pts) holes.erase (position);
     }
 
     // True when a skipped or undecoded frame lies in (after, upTo].
     [[nodiscard]] bool containsIn (std::int64_t after, std::int64_t upTo) const noexcept
     {
         if (holes.empty() || upTo <= after) return false;
-        const auto it = std::upper_bound (holes.begin(), holes.end(), after);
-        return it != holes.end() && *it <= upTo;
+        const auto position = std::upper_bound (holes.begin(), holes.end(), after);
+        return position != holes.end() && *position <= upTo;
     }
 
     // Forgets every hole. Nothing survives a reposition, so no gap recorded before one can matter.
@@ -87,17 +83,17 @@ private:
 
 struct DecodeFrontier
 {
-    // Timestamps are in the stream's own time base; k::noPts means "nothing yet".
-    std::int64_t lastFedDts = k::noPts; // dts of the last packet sent to the decoder
-    std::int64_t lastFedPts = k::noPts; // largest pts sent to the decoder since positioning
-    std::int64_t lastReceivedTs = k::noPts;
-    std::int64_t lastKeyTs = k::noPts;
+    // Timestamps are in the stream's own time base; libav::noPts means "nothing yet".
+    std::int64_t lastFedDts = libav::noPts; // dts of the last packet sent to the decoder
+    std::int64_t lastFedPts = libav::noPts; // largest pts sent to the decoder since positioning
+    std::int64_t lastReceivedTs = libav::noPts;
+    std::int64_t lastKeyTs = libav::noPts;
     // Furthest frame end seen since positioning. Not lastReceivedTs plus a duration: a stream whose
     // timestamps jump backwards can receive an earlier frame after a later one.
     std::int64_t lastEnd = std::numeric_limits<std::int64_t>::min();
     // Output-order counter for containers that carry no timestamps of their own (raw elementary
     // streams), and the fallback timestamp for a frame that has none.
-    std::int64_t synthTs = k::noPts;
+    std::int64_t synthTs = libav::noPts;
     int receivedSinceSeek = 0; // frames out of the decoder since the last positioning
     bool eof = false;
     bool draining = false;
@@ -107,9 +103,9 @@ struct DecodeFrontier
     // Nearest-keyframe mode: the keyframe packet that was fed *is* the answer, established at the
     // packet level by the landing scan and not from the frame that comes out. Without it the first
     // keyframe out of the decoder only answers the request when the seek aimed at the request
-    // itself. Set where the keyframe is fed and drained (FramePipeline::armKeyframeDecode) and read
-    // by the selection loop, so it lives beside `draining`/`drained` rather than with the landing:
-    // it is a fact about this decode pass, not about where the demuxer was put.
+    // itself. Set where the keyframe is fed and drained (FrameSelector::feedKeyframeAndDrain), so it
+    // lives beside `draining`/`drained` rather than with the landing: it is a fact about this decode
+    // pass, not about where the demuxer was put.
     bool landingKnown = false;
     bool tainted = false; // a decode error occurred since the last keyframe
     SkippedFrames skipped;
@@ -118,11 +114,11 @@ struct DecodeFrontier
     // nothing decoded before that describes where the decoder is now.
     void reset() noexcept
     {
-        lastFedDts = lastFedPts = k::noPts;
-        lastReceivedTs = k::noPts;
-        lastKeyTs = k::noPts;
+        lastFedDts = lastFedPts = libav::noPts;
+        lastReceivedTs = libav::noPts;
+        lastKeyTs = libav::noPts;
         lastEnd = std::numeric_limits<std::int64_t>::min();
-        synthTs = k::noPts;
+        synthTs = libav::noPts;
         receivedSinceSeek = 0;
         eof = draining = drained = landingKnown = false;
         tainted = false;

@@ -1,20 +1,18 @@
 #pragma once
 // stills/stills_AssetImageGenerator.h — AssetImageGenerator: the public entry point.
 
-#include <algorithm>
 #include <cassert>
-#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <initializer_list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -59,21 +57,9 @@ public:
 
         if (! pipeline) return std::unexpected (std::move (pipeline.error()));
         auto engine = std::make_shared<detail::Engine> (std::move (options), std::move (*pipeline));
-#if defined(__cpp_exceptions) && __cpp_exceptions
-        try
-        {
-            engine->worker = std::thread ([eng = engine] { eng->run(); });
-        }
-        catch (const std::system_error& e)
-        {
-            return detail::fail (ErrorCode::internal, std::string ("failed to start worker thread: ") + e.what());
-        }
-#else
-        // -fno-exceptions: std::thread's constructor calls std::terminate instead of throwing, so
-        // there is nothing to report and nothing to catch.
-        engine->worker = std::thread ([eng = engine] { eng->run(); });
-#endif
-        engine->startGate.count_down(); // the thread is stored; the body may run
+
+        if (auto started = engine->startWorker (engine); ! started)
+            return std::unexpected (std::move (started.error()));
         return AssetImageGenerator{ std::move (engine) };
     }
 
@@ -111,7 +97,7 @@ public:
     [[nodiscard]] const AssetInfo& getInfo() const noexcept
     {
         static const AssetInfo empty{};
-        return engine ? engine->pipeline->getInfo() : empty;
+        return engine ? engine->getPipeline().getInfo() : empty;
     }
 
     /// Which decode path is active. Returned by value because a late hardware failure can switch
@@ -119,13 +105,13 @@ public:
     /// consistent.
     [[nodiscard]] ActiveDecoder getActiveDecoder() const
     {
-        return engine ? engine->pipeline->getActiveDecoder() : ActiveDecoder{};
+        return engine ? engine->getPipeline().getActiveDecoder() : ActiveDecoder{};
     }
 
     [[nodiscard]] const Options& getOptions() const noexcept
     {
         static const Options empty{};
-        return engine ? engine->options : empty;
+        return engine ? engine->getOptions() : empty;
     }
 
     /// Blocks until the frame for `requested` (asset-relative, zero = first frame) is decoded and
@@ -136,28 +122,9 @@ public:
     [[nodiscard]] std::expected<Image, Error> imageAt (Time requested, const RequestOptions& options = {})
     {
         if (! engine) return detail::fail (ErrorCode::invalidState, "generator has been moved from");
-        if (engine->stopFlag.load()) return detail::fail (ErrorCode::cancelled, "generator is shutting down");
-        const detail::CancelToken token{ nullptr, &engine->stopFlag };
-        engine->syncWaiters.fetch_add (1, std::memory_order_acq_rel);
-        {
-            // Yield to the worker when it has claimed a turn after being deferred for too long. Without
-            // this, callers looping on imageAt() keep winning `decoderMutex` back from it (a
-            // std::mutex grants no fairness) and a batch running alongside them barely advances.
-            std::unique_lock qlk (engine->queueMutex);
-            engine->turnCv.wait (qlk, [&]
-                                 { return ! engine->workerTurn || engine->stopFlag.load (std::memory_order_acquire); });
-        }
-
-        std::unique_lock lk (engine->decoderMutex);
-        {
-            // Decrement under the queue mutex: the worker waits on queueCv for "no sync caller waiting",
-            // and a notify issued between its predicate check and its block would otherwise be lost.
-            std::lock_guard qlk (engine->queueMutex);
-            engine->syncWaiters.fetch_sub (1, std::memory_order_acq_rel);
-        }
-
-        engine->queueCv.notify_all();
-        return engine->pipeline->imageAt (requested, options, token);
+        if (engine->isStopping()) return detail::fail (ErrorCode::cancelled, "generator is shutting down");
+        const std::unique_lock decoderLock = engine->acquireDecoderForSyncCall();
+        return engine->getPipeline().imageAt (requested, options, engine->makeSyncCancelToken());
     }
 
     /// Queues one item per time. Guarantees: exactly one Completion per time, delivered in request
@@ -236,22 +203,7 @@ private:
     void closeImpl() noexcept
     {
         if (! engine) return;
-        engine->requestStop();
-
-        if (engine->worker.joinable())
-        {
-            if (std::this_thread::get_id() == engine->worker.get_id())
-            {
-                // Destroyed from inside a handler: the worker keeps the engine alive through its captured
-                // shared_ptr and finishes draining (as cancelled) on its own.
-                engine->worker.detach();
-            }
-            else
-            {
-                engine->worker.join();
-            }
-        }
-
+        engine->shutdown();
         engine.reset();
     }
 

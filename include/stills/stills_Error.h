@@ -11,7 +11,7 @@
 
 #include "stills/detail/stills_Config.h"
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 #include <format>
 #endif
 
@@ -164,7 +164,7 @@ struct std::is_error_code_enum<stills::ErrorCode> : std::true_type
 {
 };
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 template <>
 struct std::formatter<stills::Error> : std::formatter<std::string>
 {

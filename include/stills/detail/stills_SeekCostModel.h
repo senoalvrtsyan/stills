@@ -48,34 +48,34 @@ public:
     void learn (int frames, bool seeked) noexcept
     {
         const auto now = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli> (now - requestStartedAt).count();
+        const double elapsedMs = std::chrono::duration<double, std::milli> (now - requestStartedAt).count();
 
         if (frames <= 0) return;
         if (! seeked)
         {
-            ema (frameCostMs, ms / frames);
+            blend (frameCostMs, elapsedMs / frames);
             return;
         }
 
         if (firstFrameAt && *firstFrameAt >= requestStartedAt)
         {
-            ema (seekCostMs, std::chrono::duration<double, std::milli> (*firstFrameAt - requestStartedAt).count());
+            blend (seekCostMs, std::chrono::duration<double, std::milli> (*firstFrameAt - requestStartedAt).count());
 
             if (frames > 1)
             {
-                ema (frameCostMs,
-                     std::chrono::duration<double, std::milli> (now - *firstFrameAt).count() / (frames - 1));
+                blend (frameCostMs,
+                       std::chrono::duration<double, std::milli> (now - *firstFrameAt).count() / (frames - 1));
             }
         }
         else if (frameCostMs > 0)
         {
             // No first-frame mark (the frames came from the decoder's own buffer): subtract what the
             // extra frames are known to cost and attribute the rest to the seek.
-            ema (seekCostMs, std::max (0.0, ms - (frames - 1) * frameCostMs));
+            blend (seekCostMs, std::max (0.0, elapsedMs - (frames - 1) * frameCostMs));
         }
         else
         {
-            ema (seekCostMs, ms);
+            blend (seekCostMs, elapsedMs);
         }
     }
 
@@ -86,7 +86,10 @@ public:
 
 private:
     // Weighted towards history (0.7) so one descheduled request does not move the decision.
-    static void ema (double& acc, double sample) noexcept { acc = acc > 0 ? acc * 0.7 + sample * 0.3 : sample; }
+    static void blend (double& average, double sample) noexcept
+    {
+        average = average > 0 ? average * 0.7 + sample * 0.3 : sample;
+    }
 
     double seekCostMs = 0;
     double frameCostMs = 0;

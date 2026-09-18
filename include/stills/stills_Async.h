@@ -80,7 +80,7 @@ enum class WaitResult : std::uint8_t
 namespace detail
 {
 struct Batch;
-struct Engine;
+class Engine;
 } // namespace detail
 
 /// Delivered to the completion handler exactly once per requested time.
@@ -114,7 +114,7 @@ struct Completion
     void cancelBatch() const noexcept;
 
 private:
-    friend struct detail::Engine;
+    friend class detail::Engine;
 
     // The batch this completion is being delivered from. Set by the engine, read only by
     // cancelBatch(). Weak, not raw: a Completion may be moved out of the handler to keep its Image,
@@ -221,7 +221,7 @@ private:
 
 } // namespace stills
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 STILLS_DEFINE_ENUM_FORMATTER (stills::GenerationStatus);
 STILLS_DEFINE_ENUM_FORMATTER (stills::WaitResult);
 #endif

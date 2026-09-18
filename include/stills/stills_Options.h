@@ -160,6 +160,49 @@ struct HardwareOptions
     std::string device = {};
 };
 
+namespace detail
+{
+
+// The output-box check Options and RequestOptions share: not negative, and at least 2x2 for
+// chroma-subsampled formats, whose dimensions must be even. `field` names the option in the message.
+[[nodiscard]] inline std::expected<void, Error> validateMaximumSize (const std::optional<Size>& maximumSize,
+                                                                     PixelFormat format, std::string_view field)
+{
+    if (! maximumSize) return {};
+    const auto bad = [&] (std::string_view message)
+    { return std::unexpected (Error{ ErrorCode::invalidArgument, 0, std::string{ field } + std::string{ message } }); };
+
+    if (maximumSize->width < 0 || maximumSize->height < 0) return bad (" must not be negative");
+    const bool tooSmall =
+        (maximumSize->width > 0 && maximumSize->width < 2) || (maximumSize->height > 0 && maximumSize->height < 2);
+
+    if (hasChromaSubsampling (format) && tooSmall)
+    {
+        return bad (" must be at least 2x2 for chroma-subsampled output formats");
+    }
+
+    return {};
+}
+
+// Each side of a tolerance is a finite non-negative Time or +inf.
+[[nodiscard]] inline std::expected<void, Error> validateTolerance (const Tolerance& tolerance, std::string_view field)
+{
+    for (const Time* side : { &tolerance.before, &tolerance.after })
+    {
+        const bool ok = side->isPositiveInfinity() || (side->isFinite() && ! side->isNegative());
+
+        if (! ok)
+        {
+            return std::unexpected (Error{ ErrorCode::invalidArgument, 0,
+                                           std::string{ field } + " must be finite and non-negative, or +inf" });
+        }
+    }
+
+    return {};
+}
+
+} // namespace detail
+
 /// Per-request overrides of Options. They travel with the request, so they are thread-safe by
 /// construction: the same generator serves a batch of `Tolerance::any()` thumbnails and an exact
 /// full-size still, without a second decoder. The pixel format stays fixed (it determines the
@@ -176,33 +219,12 @@ struct RequestOptions
     /// a failure as invalidArgument (per item, for batches).
     [[nodiscard]] std::expected<void, Error> validate (PixelFormat format) const
     {
-        const auto bad = [] (std::string message)
-        { return std::unexpected (Error{ ErrorCode::invalidArgument, 0, std::move (message) }); };
-
-        if (maximumSize)
+        if (auto box = detail::validateMaximumSize (maximumSize, format, "RequestOptions::maximumSize"); ! box)
         {
-            if (maximumSize->width < 0 || maximumSize->height < 0)
-                return bad ("RequestOptions::maximumSize must not be negative");
-
-            if (hasChromaSubsampling (format)
-                && ((maximumSize->width > 0 && maximumSize->width < 2)
-                    || (maximumSize->height > 0 && maximumSize->height < 2)))
-            {
-                return bad ("RequestOptions::maximumSize must be at least 2x2 for chroma-subsampled output "
-                            "formats");
-            }
+            return box;
         }
 
-        if (tolerance)
-        {
-            for (const Time* t : { &tolerance->before, &tolerance->after })
-            {
-                const bool ok = t->isPositiveInfinity() || (t->isFinite() && ! t->isNegative());
-
-                if (! ok) return bad ("RequestOptions::tolerance must be finite and non-negative, or +inf");
-            }
-        }
-
+        if (tolerance) return detail::validateTolerance (*tolerance, "RequestOptions::tolerance");
         return {};
     }
 };
@@ -282,17 +304,7 @@ struct Options
         const auto bad = [] (std::string message)
         { return std::unexpected (Error{ ErrorCode::invalidArgument, 0, std::move (message) }); };
 
-        if (maximumSize)
-        {
-            if (maximumSize->width < 0 || maximumSize->height < 0) return bad ("maximumSize must not be negative");
-            if (hasChromaSubsampling (pixelFormat)
-                && ((maximumSize->width > 0 && maximumSize->width < 2)
-                    || (maximumSize->height > 0 && maximumSize->height < 2)))
-            {
-                return bad ("maximumSize must be at least 2x2 for chroma-subsampled output formats");
-            }
-        }
-
+        if (auto box = detail::validateMaximumSize (maximumSize, pixelFormat, "maximumSize"); ! box) return box;
         if (decoderThreads < 0) return bad ("decoderThreads must not be negative");
         if (decoderThreads > maxDecoderThreads)
         {
@@ -303,13 +315,7 @@ struct Options
         if (maxInputPixels && *maxInputPixels < 1)
             return bad ("maxInputPixels must be at least 1 (use nullopt for no limit)");
 
-        for (const Time* t : { &tolerance.before, &tolerance.after })
-        {
-            const bool ok = t->isPositiveInfinity() || (t->isFinite() && ! t->isNegative());
-
-            if (! ok) return bad ("tolerance must be finite and non-negative, or +inf");
-        }
-
+        if (auto window = detail::validateTolerance (tolerance, "tolerance"); ! window) return window;
         if (videoStreamIndex && *videoStreamIndex < 0) return bad ("videoStreamIndex must not be negative");
         if (hardware.policy == HardwarePolicy::softwareOnly && (hardware.deviceType || ! hardware.device.empty()))
         {
@@ -333,7 +339,7 @@ struct Options
 
 } // namespace stills
 
-#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#if STILLS_HAS_FORMAT
 STILLS_DEFINE_ENUM_FORMATTER (stills::HardwareDeviceType);
 STILLS_DEFINE_ENUM_FORMATTER (stills::HardwarePolicy);
 STILLS_DEFINE_ENUM_FORMATTER (stills::Scaler);

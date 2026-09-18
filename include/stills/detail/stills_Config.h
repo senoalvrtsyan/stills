@@ -16,3 +16,15 @@
 #if ! defined(__SIZEOF_INT128__)
 #error "stills requires a compiler with __int128 support (GCC or Clang)."
 #endif
+
+// Whether the std::formatter specialisations for the library's enums and value types are defined.
+// The feature-test macro alone is not enough: libc++ shipped a usable <format> in 17 but withheld
+// __cpp_lib_format until the whole facility was complete, and Xcode's libc++ does the same, so a
+// test of the macro alone would silently leave a Clang consumer without the formatters.
+#if defined(__cpp_lib_format) && __cpp_lib_format >= 201907L
+#define STILLS_HAS_FORMAT 1
+#elif defined(_LIBCPP_VERSION) && _LIBCPP_VERSION >= 170000 && __has_include(<format>)
+#define STILLS_HAS_FORMAT 1
+#else
+#define STILLS_HAS_FORMAT 0
+#endif

@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-#include "support/frame_index.hpp"
+#include "support/stills_TestFrameIndex.h"
 
 namespace testsupport
 {

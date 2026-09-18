@@ -5,7 +5,7 @@
 #include <stills/stills_Interop.h>
 #include <type_traits>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace std::chrono_literals;
 using stills::Rational;
