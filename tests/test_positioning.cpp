@@ -7,7 +7,7 @@
 #include <thread>
 #include <vector>
 
-#include "support/common.hpp"
+#include "support/stills_TestCommon.h"
 
 using namespace testsupport;
 using namespace std::chrono_literals;
@@ -17,117 +17,140 @@ using stills::ErrorCode;
 using stills::OutOfRangePolicy;
 using stills::Time;
 
-namespace {
+namespace
+{
 
-stills::Options bounds_options(OutOfRangePolicy policy) {
-  stills::Options o = sw_options();
-  o.out_of_range = policy;
-  return o;
+stills::Options boundsOptions (OutOfRangePolicy policy)
+{
+    stills::Options o = swOptions();
+    o.outOfRange = policy;
+    return o;
 }
 
-}  // namespace
+} // namespace
 
 // A time past the last frame but inside the one-frame slack the bounds pre-check allows must
 // answer the same way every time, whatever an earlier request left behind: a held frame that
 // claims to cover every time at or after its pts would come back as an unflagged Image.
-TEST_CASE("positioning: a past-the-end request answers the same however the generator got there",
-          "[sync][bounds]") {
-  struct Case {
-    const char* fixture;
-    Time past_the_end;  // beyond the last frame, inside the pre-check's one-frame slack
-    Time elsewhere;     // a far-away time that moves held_ and starts a new run
-  };
-  const Case cases[] = {
-      {"counter.mp4", Time{402, 100}, Time{1, 3}},     // ends at 4.0 s
-      {"counter_vfr.mp4", Time{119, 30}, Time{1, 3}},  // ends at 3.9333 s
-  };
-  for (const Case& c : cases) {
-    DYNAMIC_SECTION(c.fixture) {
-      {
-        INFO("OutOfRangePolicy::error");
-        auto g = REQUIRE_OK(AssetImageGenerator::open(fixture(c.fixture).string(),
-                                                      bounds_options(OutOfRangePolicy::error)));
-        REQUIRE_ERROR(g.image_at(c.past_the_end), ErrorCode::time_out_of_range);
-        (void)REQUIRE_OK(g.image_at(c.elsewhere));  // moves held_, starts a new run
-        // The same request on the same generator must not answer differently because of history.
-        REQUIRE_ERROR(g.image_at(c.past_the_end), ErrorCode::time_out_of_range);
-      }
-      {
-        INFO("OutOfRangePolicy::clamp_to_last_frame");
-        auto g = REQUIRE_OK(AssetImageGenerator::open(
-            fixture(c.fixture).string(), bounds_options(OutOfRangePolicy::clamp_to_last_frame)));
-        auto first = REQUIRE_OK(g.image_at(c.past_the_end));
-        CHECK(first.was_clamped());
-        const int last_index = frame_index_of(first);
-        (void)REQUIRE_OK(g.image_at(c.elsewhere));
-        auto again = REQUIRE_OK(g.image_at(c.past_the_end));
-        CHECK(frame_index_of(again) == last_index);
-        CHECK(again.was_clamped());  // the clamp must survive the second answer
-      }
+TEST_CASE ("positioning: a past-the-end request answers the same however the generator got there", "[sync][bounds]")
+{
+    struct Case
+    {
+        const char* fixture;
+        Time pastTheEnd; // beyond the last frame, inside the pre-check's one-frame slack
+        Time elsewhere;  // a far-away time that moves held and starts a new run
+    };
+
+    const Case cases[] = {
+        { "counter.mp4", Time{ 402, 100 }, Time{ 1, 3 } },    // ends at 4.0 s
+        { "counter_vfr.mp4", Time{ 119, 30 }, Time{ 1, 3 } }, // ends at 3.9333 s
+    };
+
+    for (const Case& c : cases)
+    {
+        DYNAMIC_SECTION (c.fixture)
+        {
+            {
+                INFO ("OutOfRangePolicy::error");
+                auto g = REQUIRE_OK (
+                    AssetImageGenerator::open (fixture (c.fixture).string(), boundsOptions (OutOfRangePolicy::error)));
+                REQUIRE_ERROR (g.imageAt (c.pastTheEnd), ErrorCode::timeOutOfRange);
+                (void)REQUIRE_OK (g.imageAt (c.elsewhere)); // moves held, starts a new run
+                // The same request on the same generator must not answer differently because of history.
+                REQUIRE_ERROR (g.imageAt (c.pastTheEnd), ErrorCode::timeOutOfRange);
+            }
+
+            {
+                INFO ("OutOfRangePolicy::clampToLastFrame");
+                auto g = REQUIRE_OK (AssetImageGenerator::open (fixture (c.fixture).string(),
+                                                                boundsOptions (OutOfRangePolicy::clampToLastFrame)));
+                auto first = REQUIRE_OK (g.imageAt (c.pastTheEnd));
+                CHECK (first.wasClamped());
+                const int lastIndex = frameIndexOf (first);
+                (void)REQUIRE_OK (g.imageAt (c.elsewhere));
+                auto again = REQUIRE_OK (g.imageAt (c.pastTheEnd));
+                CHECK (frameIndexOf (again) == lastIndex);
+                CHECK (again.wasClamped()); // the clamp must survive the second answer
+            }
+        }
     }
-  }
 }
 
 // A request cancelled before it reached its target fed packets to the decoder under *its* skip
 // window, so frames between the decoder's frontier and those packets may never be produced. The
 // next forward request must not conclude that the frame it is holding covers the requested time.
 //
-// counter.mp4: GOP 30, IDR at 60, bframes=2 b-adapt=0. image_at(61/30) positions inside the GOP;
+// counter.mp4: GOP 30, IDR at 60, bframes=2 b-adapt=0. imageAt(61/30) positions inside the GOP;
 // a batch request for a later frame of the same GOP feeds B65 with AVDISCARD_NONREF; cancelling it
-// leaves frame 65 skipped; image_at(65/30) then returned frame 64 with frame 64's actual_time().
-TEST_CASE("positioning: a cancelled request does not make the next one return the previous frame",
-          "[async][cancel][sweep]") {
-  const stills::Options o = sw_options();
-  int checked = 0;
-  for (const int target : {70, 85, 88}) {
-    for (int cut = 1; cut <= 4; ++cut) {
-      auto g = REQUIRE_OK(AssetImageGenerator::open(fixture("counter.mp4").string(), o));
-      auto anchor = REQUIRE_OK(g.image_at(Time{61, 30}));
-      REQUIRE(frame_index_of(anchor) == 61);
-      std::atomic<bool> done{false};
-      auto req = g.generate_images({Time{target, 30}}, [&](Completion) { done.store(true); });
-      // Cancel part-way to the target, at four depths into the forward decode. Decoding the
-      // ~27 frames between the anchor and the target takes on the order of a millisecond here,
-      // so 100 us steps land inside it; `done` keeps the wait bounded if it ever does not.
-      for (int i = 0; i < cut && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::microseconds{100});
-      req.cancel();
-      REQUIRE(req.wait_for(30s) == stills::WaitResult::finished);
-      for (int n = 62; n < 70; ++n) {
-        auto img = REQUIRE_OK(g.image_at(Time{n, 30}));
-        INFO("target " << target << " cut " << cut << " tick " << n << ": got "
-                       << frame_index_of(img) << " at " << img.actual_time());
-        CHECK(frame_index_of(img) == n);
-        CHECK(img.actual_time() == Time{n, 30});
-        ++checked;
-      }
+// leaves frame 65 skipped; imageAt(65/30) then returned frame 64 with frame 64's getActualTime().
+TEST_CASE ("positioning: a cancelled request does not make the next one return the previous frame",
+           "[async][cancel][sweep]")
+{
+    const stills::Options o = swOptions();
+    int checked = 0;
+
+    for (const int target : { 70, 85, 88 })
+    {
+        for (int cut = 1; cut <= 4; ++cut)
+        {
+            auto g = REQUIRE_OK (AssetImageGenerator::open (fixture ("counter.mp4").string(), o));
+            auto anchor = REQUIRE_OK (g.imageAt (Time{ 61, 30 }));
+            REQUIRE (frameIndexOf (anchor) == 61);
+            std::atomic<bool> done{ false };
+            auto req = g.generateImages ({ Time{ target, 30 } }, [&] (Completion) { done.store (true); });
+
+            // Cancel part-way to the target, at four depths into the forward decode. Decoding the
+            // ~27 frames between the anchor and the target takes on the order of a millisecond here,
+            // so 100 us steps land inside it; `done` keeps the wait bounded if it ever does not.
+            for (int i = 0; i < cut && ! done.load(); ++i)
+                std::this_thread::sleep_for (std::chrono::microseconds{ 100 });
+            req.cancel();
+            REQUIRE (req.waitFor (30s) == stills::WaitResult::finished);
+
+            for (int n = 62; n < 70; ++n)
+            {
+                auto img = REQUIRE_OK (g.imageAt (Time{ n, 30 }));
+                INFO ("target " << target << " cut " << cut << " tick " << n << ": got " << frameIndexOf (img) << " at "
+                                << img.getActualTime());
+                CHECK (frameIndexOf (img) == n);
+                CHECK (img.getActualTime() == Time{ n, 30 });
+                ++checked;
+            }
+        }
     }
-  }
-  CHECK(checked == 3 * 4 * 8);
+
+    CHECK (checked == 3 * 4 * 8);
 }
+
 // M1: an MPEG-TS whose timestamps jump backwards (two recordings concatenated). Decoding forward
 // across the jump to the end leaves the last decoded frame *below* every later request, and the
 // end-of-stream shortcut concluded from it without ever repositioning: every later request,
-// including Time::zero(), failed time_out_of_range with no seek attempted.
-TEST_CASE("positioning: the generator stays usable after scanning across a backwards discontinuity",
-          "[containers][bounds]") {
-  auto g = REQUIRE_OK(AssetImageGenerator::open(fixture("disc.ts").string(),
-                                                bounds_options(OutOfRangePolicy::error)));
-  // Scan sequentially into the second segment, where the timestamps go backwards.
-  for (int n = 0; n < 120; ++n) {
-    auto img = g.image_at(Time{n, 30});
-    if (!img) {
-      INFO("tick " << n << ": " << img.error());
-      CHECK(img.error().code == ErrorCode::time_out_of_range);
-      break;
+// including Time::zero(), failed timeOutOfRange with no seek attempted.
+TEST_CASE ("positioning: the generator stays usable after scanning across a backwards discontinuity",
+           "[containers][bounds]")
+{
+    auto g =
+        REQUIRE_OK (AssetImageGenerator::open (fixture ("disc.ts").string(), boundsOptions (OutOfRangePolicy::error)));
+
+    // Scan sequentially into the second segment, where the timestamps go backwards.
+    for (int n = 0; n < 120; ++n)
+    {
+        auto img = g.imageAt (Time{ n, 30 });
+
+        if (! img)
+        {
+            INFO ("tick " << n << ": " << img.error());
+            CHECK (img.error().code == ErrorCode::timeOutOfRange);
+            break;
+        }
     }
-  }
-  // Whatever the scan concluded, the generator must still answer requests it answered before.
-  for (const int n : {0, 30, 50, 60}) {
-    auto img = g.image_at(Time{n, 30});
-    INFO("after the scan, tick " << n << ": "
-                                 << (img ? std::string{"ok"} : to_string(img.error())));
-    REQUIRE(img.has_value());
-    CHECK(frame_index_of(*img) == n);
-  }
+
+    // Whatever the scan concluded, the generator must still answer requests it answered before.
+    for (const int n : { 0, 30, 50, 60 })
+    {
+        auto img = g.imageAt (Time{ n, 30 });
+        INFO ("after the scan, tick " << n << ": " << (img ? std::string{ "ok" } : toString (img.error())));
+        REQUIRE (img.has_value());
+        CHECK (frameIndexOf (*img) == n);
+    }
 }
